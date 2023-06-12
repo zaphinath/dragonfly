@@ -40,18 +40,19 @@ jobs:
           ls -l ..
 
       - name: Run PyTests
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           ls -l ${GITHUB_WORKSPACE}/
           cd ${GITHUB_WORKSPACE}/tests
           echo "Current commit is ${{github.sha}}"
           pip install -r dragonfly/requirements.txt
           export DRAGONFLY_PATH="${GITHUB_WORKSPACE}/build/dragonfly" # used by PyTests
+          export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 # to crash on errors
 
           pytest -sxvr dragonfly --ignore=dragonfly/replication_test.py
       - name: Run PyTests replication test
         if: ${{ matrix.runner  == 'ubuntu-latest' }}
-        timeout-minutes: 15
+        timeout-minutes: 20
         run: |
           cd ${GITHUB_WORKSPACE}/tests
           export DRAGONFLY_PATH="${GITHUB_WORKSPACE}/build/dragonfly" # used by PyTests

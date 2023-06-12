@@ -27,6 +27,7 @@ class JournalSlice {
 
   std::error_code Close();
 
+  // This is always the LSN of the *next* journal entry.
   LSN cur_lsn() const {
     return lsn_;
   }
@@ -44,6 +45,10 @@ class JournalSlice {
 
   uint32_t RegisterOnChange(ChangeCallback cb);
   void UnregisterOnChange(uint32_t);
+  bool HasRegisteredCallbacks() const {
+    std::shared_lock lk(cb_mu_);
+    return !change_cb_arr_.empty();
+  }
 
  private:
   struct RingItem;
@@ -52,8 +57,8 @@ class JournalSlice {
   std::unique_ptr<LinuxFile> shard_file_;
   std::optional<base::RingBuffer<RingItem>> ring_buffer_;
 
-  util::SharedMutex cb_mu_;
-  std::vector<std::pair<uint32_t, ChangeCallback>> change_cb_arr_;
+  mutable util::SharedMutex cb_mu_;
+  std::vector<std::pair<uint32_t, ChangeCallback>> change_cb_arr_ ABSL_GUARDED_BY(cb_mu_);
 
   size_t file_offset_ = 0;
   LSN lsn_ = 1;

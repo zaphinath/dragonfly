@@ -1,3 +1,5 @@
+#include <optional>
+
 extern "C" {
 #include "redis/crc16.h"
 }
@@ -32,13 +34,39 @@ SlotId ClusterConfig::KeySlot(string_view key) {
   return crc16(tag.data(), tag.length()) & kMaxSlotNum;
 }
 
-ClusterConfig::ClusterConfig(string_view my_id) : my_id_(my_id) {
-  cluster_enabled = true;
+namespace {
+bool HasValidNodeIds(const ClusterConfig::ClusterShards& new_config) {
+  absl::flat_hash_set<string_view> nodes;
+
+  auto CheckAndInsertNode = [&](string_view node) {
+    auto [_, inserted] = nodes.insert(node);
+    return inserted;
+  };
+
+  for (const auto& shard : new_config) {
+    if (!CheckAndInsertNode(shard.master.id)) {
+      LOG(WARNING) << "Master " << shard.master.id << " appears more than once";
+      return false;
+    }
+    for (const auto& replica : shard.replicas) {
+      if (!CheckAndInsertNode(replica.id)) {
+        LOG(WARNING) << "Replica " << replica.id << " appears more than once";
+        return false;
+      }
+    }
+  }
+
+  return true;
 }
 
-bool ClusterConfig::IsConfigValid(const vector<ClusterShard>& new_config) {
+bool IsConfigValid(const ClusterConfig::ClusterShards& new_config) {
   // Make sure that all slots are set exactly once.
-  array<bool, tuple_size<decltype(slots_)>::value> slots_found = {};
+  array<bool, ClusterConfig::kMaxSlotNum + 1> slots_found = {};
+
+  if (!HasValidNodeIds(new_config)) {
+    return false;
+  }
+
   for (const auto& shard : new_config) {
     for (const auto& slot_range : shard.slot_ranges) {
       if (slot_range.start > slot_range.end) {
@@ -72,28 +100,33 @@ bool ClusterConfig::IsConfigValid(const vector<ClusterShard>& new_config) {
 
   return true;
 }
+}  // namespace
 
-bool ClusterConfig::SetConfig(const vector<ClusterShard>& new_config) {
-  if (!IsConfigValid(new_config)) {
-    return false;
+/* static */
+unique_ptr<ClusterConfig> ClusterConfig::CreateFromConfig(string_view my_id,
+                                                          const ClusterShards& config) {
+  if (!IsConfigValid(config)) {
+    return nullptr;
   }
 
-  lock_guard gu(mu_);
+  unique_ptr<ClusterConfig> result(new ClusterConfig());
 
-  config_ = new_config;
+  result->config_ = config;
 
-  for (const auto& shard : config_) {
-    for (const auto& slot_range : shard.slot_ranges) {
-      bool owned_by_me =
-          shard.master.id == my_id_ || any_of(shard.replicas.begin(), shard.replicas.end(),
-                                              [&](const Node& node) { return node.id == my_id_; });
-      for (SlotId i = slot_range.start; i <= slot_range.end; ++i) {
-        slots_[i] = {.shard = &shard, .owned_by_me = owned_by_me};
+  for (const auto& shard : result->config_) {
+    bool owned_by_me =
+        shard.master.id == my_id || any_of(shard.replicas.begin(), shard.replicas.end(),
+                                           [&](const Node& node) { return node.id == my_id; });
+    if (owned_by_me) {
+      for (const auto& slot_range : shard.slot_ranges) {
+        for (SlotId i = slot_range.start; i <= slot_range.end; ++i) {
+          result->my_slots_.set(i);
+        }
       }
     }
   }
 
-  return true;
+  return result;
 }
 
 namespace {
@@ -220,39 +253,53 @@ optional<ClusterConfig::ClusterShards> BuildClusterConfigFromJson(const JsonType
 }
 }  // namespace
 
-bool ClusterConfig::SetConfig(const JsonType& json) {
-  optional<ClusterShards> config = BuildClusterConfigFromJson(json);
+/* static */
+unique_ptr<ClusterConfig> ClusterConfig::CreateFromConfig(string_view my_id,
+                                                          const JsonType& json_config) {
+  optional<ClusterShards> config = BuildClusterConfigFromJson(json_config);
   if (!config.has_value()) {
-    return false;
+    return nullptr;
   }
 
-  return SetConfig(config.value());
+  return CreateFromConfig(my_id, config.value());
 }
 
 bool ClusterConfig::IsMySlot(SlotId id) const {
-  if (id >= slots_.size()) {
+  if (id >= my_slots_.size()) {
     DCHECK(false) << "Requesting a non-existing slot id " << id;
     return false;
   }
 
-  shared_lock gu(mu_);
-  return slots_[id].owned_by_me;
+  return my_slots_.test(id);
 }
 
 ClusterConfig::Node ClusterConfig::GetMasterNodeForSlot(SlotId id) const {
-  shared_lock gu(mu_);
+  CHECK_LT(id, my_slots_.size()) << "Requesting a non-existing slot id " << id;
 
-  CHECK_LT(id, slots_.size()) << "Requesting a non-existing slot id " << id;
-  CHECK_NE(slots_[id].shard, nullptr)
-      << "Calling GetMasterNodeForSlot(" << id << ") before SetConfig()";
+  for (const auto& shard : config_) {
+    for (const auto& range : shard.slot_ranges) {
+      if (id >= range.start && id <= range.end) {
+        return shard.master;
+      }
+    }
+  }
 
-  return slots_[id].shard->master;
+  DCHECK(false) << "Can't find master node for slot " << id;
+  return {};
 }
 
 ClusterConfig::ClusterShards ClusterConfig::GetConfig() const {
-  shared_lock gu(mu_);
-
   return config_;
+}
+
+SlotSet ClusterConfig::GetOwnedSlots() const {
+  SlotSet set;
+  for (SlotId id = 0; id <= kMaxSlotNum; ++id) {
+    if (IsMySlot(id)) {
+      set.insert(id);
+    }
+  }
+  return set;
 }
 
 }  // namespace dfly

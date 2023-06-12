@@ -35,7 +35,8 @@ DoubleToStringConverter dfly_conv(kConvFlags, "inf", "nan", 'e', -6, 21, 6, 0);
 
 }  // namespace
 
-SinkReplyBuilder::SinkReplyBuilder(::io::Sink* sink) : sink_(sink) {
+SinkReplyBuilder::SinkReplyBuilder(::io::Sink* sink)
+    : sink_(sink), should_batch_(false), should_aggregate_(false) {
 }
 
 void SinkReplyBuilder::CloseConnection() {
@@ -45,29 +46,27 @@ void SinkReplyBuilder::CloseConnection() {
 
 void SinkReplyBuilder::Send(const iovec* v, uint32_t len) {
   DCHECK(sink_);
+  constexpr size_t kMaxBatchSize = 1024;
 
-  if (should_batch_) {
-    size_t total_size = batch_.size();
+  size_t bsize = 0;
+  for (unsigned i = 0; i < len; ++i) {
+    bsize += v[i].iov_len;
+  }
+
+  // Allow batching with up to 8K of data.
+  if ((should_batch_ || should_aggregate_) && batch_.size() + bsize < kMaxBatchSize) {
     for (unsigned i = 0; i < len; ++i) {
-      total_size += v[i].iov_len;
+      std::string_view src((char*)v[i].iov_base, v[i].iov_len);
+      DVLOG(2) << "Appending to stream " << src;
+      batch_.append(src.data(), src.size());
     }
-
-    if (total_size < 8192) {  // Allow batching with up to 8K of data.
-      for (unsigned i = 0; i < len; ++i) {
-        std::string_view src((char*)v[i].iov_base, v[i].iov_len);
-        DVLOG(2) << "Appending to stream " << src;
-        batch_.append(src.data(), src.size());
-      }
-      return;
-    }
+    return;
   }
 
   error_code ec;
   ++io_write_cnt_;
-
-  for (unsigned i = 0; i < len; ++i) {
-    io_write_bytes_ += v[i].iov_len;
-  }
+  io_write_bytes_ += bsize;
+  DVLOG(2) << "Writing " << bsize << " bytes of len " << len;
 
   if (batch_.empty()) {
     ec = sink_->Write(v, len);
@@ -105,10 +104,26 @@ void SinkReplyBuilder::SendRawVec(absl::Span<const std::string_view> msg_vec) {
   Send(arr.data(), msg_vec.size());
 }
 
-MCReplyBuilder::MCReplyBuilder(::io::Sink* sink) : SinkReplyBuilder(sink) {
+void SinkReplyBuilder::StopAggregate() {
+  should_aggregate_ = false;
+
+  if (should_batch_ || batch_.empty())
+    return;
+
+  error_code ec = sink_->Write(io::Buffer(batch_));
+  batch_.clear();
+
+  if (ec)
+    ec_ = ec;
+}
+
+MCReplyBuilder::MCReplyBuilder(::io::Sink* sink) : SinkReplyBuilder(sink), noreply_(false) {
 }
 
 void MCReplyBuilder::SendSimpleString(std::string_view str) {
+  if (noreply_)
+    return;
+
   iovec v[2] = {IoVec(str), IoVec(kCRLF)};
 
   Send(v, ABSL_ARRAYSIZE(v));
@@ -284,6 +299,7 @@ void RedisReplyBuilder::SendLong(long num) {
 
 void RedisReplyBuilder::SendScoredArray(const std::vector<std::pair<std::string, double>>& arr,
                                         bool with_scores) {
+  ReplyAggregator agg(this);
   if (!with_scores) {
     StartArray(arr.size());
     for (const auto& p : arr) {
@@ -382,7 +398,13 @@ void RedisReplyBuilder::StartCollection(unsigned len, CollectionType type) {
     type = ARRAY;
   }
 
+  // We do not want to send multiple packets for small responses because these
+  // trigger TCP-related artifacts (e.g. Nagle's algorithm) that slow down the delivery of the whole
+  // response.
+  bool prev = should_aggregate_;
+  should_aggregate_ |= (len > 0);
   SendRaw(absl::StrCat(START_SYMBOLS[type], len, kCRLF));
+  should_aggregate_ = prev;
 }
 
 // This implementation a bit complicated because it uses vectorized

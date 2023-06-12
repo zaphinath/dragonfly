@@ -13,31 +13,15 @@
 
 namespace dfly::search {
 
-// Interface for accessing document values with different data structures underneath.
-struct DocumentAccessor {
-  // Callback that's supplied with field values.
-  using FieldConsumer = std::function<bool(std::string_view)>;
+using DocId = uint32_t;
 
-  virtual bool Check(FieldConsumer f, std::string_view active_field) const = 0;
-};
-
-// Wrapper around document accessor and optional active field.
-struct SearchInput {
-  SearchInput(const DocumentAccessor* doc, std::string_view active_field = {})
-      : doc_{doc}, active_field_{active_field} {
-  }
-
-  SearchInput(const SearchInput& base, std::string_view active_field)
-      : doc_{base.doc_}, active_field_{active_field} {
-  }
-
-  bool Check(DocumentAccessor::FieldConsumer f) {
-    return doc_->Check(move(f), active_field_);
-  }
-
- private:
-  const DocumentAccessor* doc_;
-  std::string_view active_field_;
+// Base class for type-specific indices.
+//
+// Queries should be done directly on subclasses with their distinc
+// query functions. All results for all index types should be sorted.
+struct BaseIndex {
+  virtual ~BaseIndex() = default;
+  virtual void Add(DocId doc, std::string_view value) = 0;
 };
 
 }  // namespace dfly::search

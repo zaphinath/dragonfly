@@ -688,7 +688,13 @@ OpStatus Transaction::ScheduleSingleHop(RunnableType cb) {
         CHECK_GE(DecreaseRunCnt(), 1u);
       }
     };
-    shard_set->Add(unique_shard_id_, std::move(schedule_cb));  // serves as a barrier.
+
+    if (coordinator_index_ == unique_shard_id_ && ServerState::tlocal()->AllowInlineScheduling()) {
+      DVLOG(2) << "Inline scheduling a transaction";
+      schedule_cb();
+    } else {
+      shard_set->Add(unique_shard_id_, std::move(schedule_cb));  // serves as a barrier.
+    }
   } else {
     // This transaction either spans multiple shards and/or is multi.
 
@@ -1110,6 +1116,9 @@ bool Transaction::WaitOnWatch(const time_point& tp, WaitKeysProvider wkeys_provi
            wakeup_requested_.load(memory_order_relaxed) > 0;
   };
 
+  auto* stats = ServerState::tl_connection_stats();
+  ++stats->num_blocked_clients;
+
   cv_status status = cv_status::no_timeout;
   if (tp == time_point::max()) {
     DVLOG(1) << "WaitOnWatch foreva " << DebugId();
@@ -1124,6 +1133,8 @@ bool Transaction::WaitOnWatch(const time_point& tp, WaitKeysProvider wkeys_provi
 
     DVLOG(1) << "WaitOnWatch await_until " << int(status);
   }
+
+  --stats->num_blocked_clients;
 
   bool is_expired = (coordinator_state_ & COORD_CANCELLED) || status == cv_status::timeout;
   UnwatchBlocking(is_expired, wkeys_provider);
@@ -1383,11 +1394,30 @@ OpResult<KeyIndex> DetermineKeys(const CommandId* cid, CmdArgList args) {
   if (cid->opt_mask() & CO::VARIADIC_KEYS) {
     // ZUNION/INTER <num_keys> <key1> [<key2> ...]
     // EVAL <script> <num_keys>
+    // XREAD ... STREAMS ...
     if (args.size() < 2) {
       return OpStatus::SYNTAX_ERR;
     }
 
     string_view name{cid->name()};
+
+    if (name == "XREAD") {
+      for (size_t i = 0; i < args.size(); ++i) {
+        string_view arg = ArgS(args, i);
+        if (absl::EqualsIgnoreCase(arg, "STREAMS")) {
+          size_t left = args.size() - i - 1;
+          if (left < 2 || left % 2 != 0)
+            return OpStatus::SYNTAX_ERR;
+
+          key_index.start = i + 1;
+          key_index.end = key_index.start + (left / 2);
+          key_index.step = 1;
+
+          return key_index;
+        }
+      }
+      return OpStatus::SYNTAX_ERR;
+    }
 
     if (absl::EndsWith(name, "STORE"))
       key_index.bonus = 0;  // Z<xxx>STORE <key> commands
@@ -1401,6 +1431,12 @@ OpResult<KeyIndex> DetermineKeys(const CommandId* cid, CmdArgList args) {
     string_view num = ArgS(args, num_keys_index);
     if (!absl::SimpleAtoi(num, &num_custom_keys) || num_custom_keys < 0)
       return OpStatus::INVALID_INT;
+
+    // TODO Fix this for Z family functions.
+    // Examples that crash: ZUNION 0 myset
+    if (name == "ZDIFF" && num_custom_keys == 0) {
+      return OpStatus::INVALID_INT;
+    }
 
     if (args.size() < size_t(num_custom_keys) + num_keys_index + 1)
       return OpStatus::SYNTAX_ERR;

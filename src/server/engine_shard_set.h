@@ -31,6 +31,7 @@ class Journal;
 }  // namespace journal
 
 class TieredStorage;
+class ShardDocIndices;
 class BlockingController;
 
 class EngineShard {
@@ -70,7 +71,7 @@ class EngineShard {
     return db_slice_;
   }
 
-  std::pmr::memory_resource* memory_resource() {
+  PMR_NS::memory_resource* memory_resource() {
     return &mi_resource_;
   }
 
@@ -113,6 +114,10 @@ class EngineShard {
 
   TieredStorage* tiered_storage() {
     return tiered_storage_.get();
+  }
+
+  ShardDocIndices* search_indices() {
+    return shard_search_indices_.get();
   }
 
   BlockingController* EnsureBlockingController();
@@ -214,6 +219,7 @@ class EngineShard {
 
   DefragTaskState defrag_state_;
   std::unique_ptr<TieredStorage> tiered_storage_;
+  std::unique_ptr<ShardDocIndices> shard_search_indices_;
   std::unique_ptr<BlockingController> blocking_controller_;
 
   using Counter = util::SlidingCounter<7>;
@@ -264,11 +270,13 @@ class EngineShardSet {
   }
 
   // Runs a brief function on all shards. Waits for it to complete.
+  // `func` must not preempt.
   template <typename U> void RunBriefInParallel(U&& func) const {
     RunBriefInParallel(std::forward<U>(func), [](auto i) { return true; });
   }
 
   // Runs a brief function on selected shard thread. Waits for it to complete.
+  // `func` must not preempt.
   template <typename U, typename P> void RunBriefInParallel(U&& func, P&& pred) const;
 
   template <typename U> void RunBlockingInParallel(U&& func);

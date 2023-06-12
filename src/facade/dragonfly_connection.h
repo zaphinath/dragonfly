@@ -44,6 +44,7 @@ class ConnectionContext;
 class RedisParser;
 class ServiceInterface;
 class MemcacheParser;
+class SinkReplyBuilder;
 
 // Connection represents an active connection for a client.
 //
@@ -62,26 +63,13 @@ class Connection : public util::Connection {
 
   // PubSub message, either incoming message for active subscription or reply for new subscription.
   struct PubMessage {
-    // Represents incoming message.
-    struct MessageData {
-      std::string pattern{};            // non-empty for pattern subscriber
-      std::shared_ptr<char[]> buf;      // stores channel name and message
-      size_t channel_len, message_len;  // lengths in buf
+    std::string pattern{};            // non-empty for pattern subscriber
+    std::shared_ptr<char[]> buf;      // stores channel name and message
+    size_t channel_len, message_len;  // lengths in buf
 
-      std::string_view Channel() const;
-      std::string_view Message() const;
-    };
+    std::string_view Channel() const;
+    std::string_view Message() const;
 
-    // Represents reply for subscribe/unsubscribe.
-    struct SubscribeData {
-      bool add;
-      std::string channel;
-      uint32_t channel_cnt;
-    };
-
-    std::variant<MessageData, SubscribeData> data;
-
-    PubMessage(bool add, std::string_view channel, uint32_t channel_cnt);
     PubMessage(std::string pattern, std::shared_ptr<char[]> buf, size_t channel_len,
                size_t message_len);
   };
@@ -127,7 +115,7 @@ class Connection : public util::Connection {
 
  public:
   // Add PubMessage to dispatch queue.
-  // Virtual because behaviour is overwritten in test_utils.
+  // Virtual because behavior is overridden in test_utils.
   virtual void SendPubMessageAsync(PubMessage);
 
   // Add monitor message to dispatch queue.
@@ -150,12 +138,15 @@ class Connection : public util::Connection {
 
   static void ShutdownThreadLocal();
 
+  bool IsCurrentlyDispatching() const;
+
   std::string GetClientInfo(unsigned thread_id) const;
   std::string RemoteEndpointStr() const;
   std::string RemoteEndpointAddress() const;
   std::string LocalBindAddress() const;
   uint32_t GetClientId() const;
-  bool IsAdmin() const;
+  // Virtual because behavior is overridden in test_utils.
+  virtual bool IsAdmin() const;
 
   Protocol protocol() const {
     return protocol_;
@@ -189,10 +180,14 @@ class Connection : public util::Connection {
   void ConnectionFlow(util::FiberSocketBase* peer);
 
   // Main loop reading client messages and passing requests to dispatch queue.
-  std::variant<std::error_code, ParserStatus> IoLoop(util::FiberSocketBase* peer);
+  std::variant<std::error_code, ParserStatus> IoLoop(util::FiberSocketBase* peer,
+                                                     SinkReplyBuilder* orig_builder);
 
   // Returns true if HTTP header is detected.
   io::Result<bool> CheckForHttpProto(util::FiberSocketBase* peer);
+
+  // Dispatch last command parsed by ParseRedis
+  void DispatchCommand(uint32_t consumed, mi_heap_t* heap);
 
   // Handles events from dispatch queue.
   void DispatchFiber(util::FiberSocketBase* peer);
@@ -202,7 +197,7 @@ class Connection : public util::Connection {
   // Create new pipeline request, re-use from pool when possible.
   PipelineMessagePtr FromArgs(RespVec args, mi_heap_t* heap);
 
-  ParserStatus ParseRedis();
+  ParserStatus ParseRedis(SinkReplyBuilder* orig_builder);
   ParserStatus ParseMemcache();
 
   void OnBreakCb(int32_t mask);

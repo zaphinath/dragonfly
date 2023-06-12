@@ -17,6 +17,7 @@ extern "C" {
 #include "redis/zset.h"
 }
 #include <absl/cleanup/cleanup.h>
+#include <absl/strings/match.h>
 #include <absl/strings/str_cat.h>
 #include <lz4frame.h>
 #include <zstd.h>
@@ -60,6 +61,7 @@ namespace {
 
 constexpr size_t kYieldPeriod = 50000;
 constexpr size_t kMaxBlobLen = 1ULL << 16;
+constexpr char kErrCat[] = "dragonfly.rdbload";
 
 inline void YieldIfNeeded(size_t i) {
   if (i % kYieldPeriod == 0) {
@@ -70,7 +72,7 @@ inline void YieldIfNeeded(size_t i) {
 class error_category : public std::error_category {
  public:
   const char* name() const noexcept final {
-    return "dragonfly.rdbload";
+    return kErrCat;
   }
 
   string message(int ev) const final;
@@ -980,7 +982,8 @@ string_view RdbLoaderBase::OpaqueObjLoader::ToSV(const RdbVariant& obj) {
 
   const base::PODArray<char>* ch_arr = get_if<base::PODArray<char>>(&obj);
   if (ch_arr) {
-    return string_view(ch_arr->data(), ch_arr->size());
+    // pass non-null pointer to avoid UB with lp API.
+    return ch_arr->empty() ? ""sv : string_view{ch_arr->data(), ch_arr->size()};
   }
 
   const LzfString* lzf = get_if<LzfString>(&obj);
@@ -990,7 +993,7 @@ string_view RdbLoaderBase::OpaqueObjLoader::ToSV(const RdbVariant& obj) {
                        lzf->uncompressed_len) == 0) {
       LOG(ERROR) << "Invalid LZF compressed string";
       ec_ = RdbError(errc::rdb_file_corrupted);
-      return string_view{};
+      return string_view{tset_blob_.data(), 0};
     }
     return string_view{tset_blob_.data(), tset_blob_.size()};
   }
@@ -1826,6 +1829,15 @@ error_code RdbLoader::Load(io::Source* src) {
       continue;
     }
 
+    if (type == RDB_OPCODE_JOURNAL_OFFSET) {
+      VLOG(1) << "Read RDB_OPCODE_JOURNAL_OFFSET";
+      uint64_t journal_offset;
+      SET_OR_RETURN(FetchInt<uint64_t>(), journal_offset);
+      VLOG(1) << "Got offset " << journal_offset;
+      journal_offset_ = journal_offset;
+      continue;
+    }
+
     if (type == RDB_OPCODE_SELECTDB) {
       unsigned dbid = 0;
 
@@ -1838,7 +1850,7 @@ error_code RdbLoader::Load(io::Source* src) {
         return RdbError(errc::bad_db_index);
       }
 
-      VLOG(1) << "Select DB: " << dbid;
+      VLOG(2) << "Select DB: " << dbid;
       for (unsigned i = 0; i < shard_set->size(); ++i) {
         // we should flush pending items before switching dbid.
         FlushShardAsync(i);
@@ -2049,7 +2061,19 @@ error_code RdbLoaderBase::HandleJournalBlob(Service* service) {
   while (done < num_entries) {
     journal::ParsedEntry entry{};
     SET_OR_RETURN(journal_reader_.ReadEntry(), entry);
+
+    if (!entry.cmd.cmd_args.empty()) {
+      if (absl::EqualsIgnoreCase(facade::ToSV(entry.cmd.cmd_args[0]), "FLUSHALL") ||
+          absl::EqualsIgnoreCase(facade::ToSV(entry.cmd.cmd_args[0]), "FLUSHDB")) {
+        // Applying a flush* operation in the middle of a load can cause out-of-sync deletions of
+        // data that should not be deleted, see https://github.com/dragonflydb/dragonfly/issues/1231
+        // By returning an error we are effectively restarting the replication.
+        return RdbError(errc::unsupported_operation);
+      }
+    }
+
     ex.Execute(entry.dbid, entry.cmd);
+    VLOG(1) << "Reading item: " << entry.ToString();
     done++;
   }
 

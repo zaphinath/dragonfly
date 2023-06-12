@@ -185,12 +185,11 @@ TEST_F(RedisReplyBuilderTest, TestMessageSend) {
   builder_->SendOk();
   ASSERT_EQ(TakePayload(), kOKMessage);
   builder_->StartArray(10);
-  ASSERT_EQ(TakePayload(), "*10\r\n");
-  sink_.Clear();
+
   std::string_view hello_msg = "hello";
   builder_->SendBulkString(hello_msg);
-  std::string expected_bulk_string =
-      absl::StrCat(kBulkStringStart, std::to_string(hello_msg.size()), kCRLF, hello_msg, kCRLF);
+  std::string expected_bulk_string = absl::StrCat(
+      "*10\r\n", kBulkStringStart, std::to_string(hello_msg.size()), kCRLF, hello_msg, kCRLF);
   ASSERT_EQ(TakePayload(), expected_bulk_string);
 }
 
@@ -760,7 +759,7 @@ TEST_F(RedisReplyBuilderTest, TestBasicCapture) {
   CapturingReplyBuilder crb{};
   using RRB = RedisReplyBuilder;
 
-  auto big_arr_cb = [kTestSws](RRB* r) {
+  auto big_arr_cb = [](RRB* r) {
     r->StartArray(4);
     {
       r->StartArray(2);
@@ -802,7 +801,7 @@ TEST_F(RedisReplyBuilderTest, TestBasicCapture) {
         r->SendDouble(2.5);
         r->SendSimpleStrArr(kTestSws);
       },
-      [kTestSws](RRB* r) {
+      [](RRB* r) {
         vector<RRB::OptResp> v = {
             RRB::ResponseValue{"key-1", "value-1", 0, 0},
             nullopt,

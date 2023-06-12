@@ -19,6 +19,7 @@ enum class Op : uint8_t {
   COMMAND = 10,
   MULTI_COMMAND = 11,
   EXEC = 12,
+  PING = 13,
 };
 
 struct EntryBase {
@@ -64,6 +65,8 @@ struct ParsedEntry : public EntryBase {
     CmdArgVec cmd_args;  // represents the parsed command.
   };
   CmdData cmd;
+
+  std::string ToString() const;
 };
 
 using ChangeCallback = std::function<void(const Entry&, bool await)>;

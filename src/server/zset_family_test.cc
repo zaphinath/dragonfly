@@ -527,4 +527,108 @@ TEST_F(ZSetFamilyTest, Resp3) {
   ASSERT_THAT(resp.GetVec()[1].GetVec(), ElementsAre("b", DoubleArg(2)));
 }
 
+TEST_F(ZSetFamilyTest, BlockingIsReleased) {
+  // Inputs for ZSET store commands.
+  Run({"ZADD", "A", "1", "x", "2", "b"});
+  Run({"ZADD", "B", "1", "x", "3", "b"});
+  Run({"ZADD", "C", "1", "x", "10", "a"});
+  Run({"ZADD", "D", "1", "x", "5", "c"});
+
+  vector<string> blocking_keys{"zset1", "zset2", "zset3"};
+  for (const auto& key : blocking_keys) {
+    vector<vector<string>> unblocking_commands;
+    // All commands output the same set {2,x}.
+    unblocking_commands.push_back({"ZADD", key, "2", "x", "10", "y"});
+    unblocking_commands.push_back({"ZINCRBY", key, "2", "x"});
+    unblocking_commands.push_back({"ZINTERSTORE", key, "2", "A", "B"});
+    unblocking_commands.push_back({"ZUNIONSTORE", key, "2", "C", "D"});
+    // unblocking_commands.push_back({"ZDIFFSTORE", key, "2", "A", "B"}); // unimplemented
+
+    for (auto& cmd : unblocking_commands) {
+      RespExpr resp0;
+      auto fb0 = pp_->at(0)->LaunchFiber(Launch::dispatch, [&] {
+        resp0 = Run({"BZPOPMIN", "zset1", "zset2", "zset3", "0"});
+        LOG(INFO) << "BZPOPMIN";
+      });
+
+      pp_->at(1)->Await([&] { return Run({cmd.data(), cmd.size()}); });
+      fb0.Join();
+
+      ASSERT_THAT(resp0, ArrLen(3)) << cmd[0];
+      EXPECT_THAT(resp0.GetVec(), ElementsAre(key, "x", "2")) << cmd[0];
+
+      Run({"DEL", key});
+    }
+  }
+}
+
+TEST_F(ZSetFamilyTest, BlockingTimeout) {
+  RespExpr resp0;
+
+  auto start = absl::Now();
+  auto fb0 = pp_->at(0)->LaunchFiber(Launch::dispatch, [&] {
+    resp0 = Run({"BZPOPMIN", "zset1", "1"});
+    LOG(INFO) << "BZPOPMIN";
+  });
+  fb0.Join();
+  auto dur = absl::Now() - start;
+
+  // Check that the timeout duration is not too crazy.
+  EXPECT_LT(AbsDuration(dur - absl::Milliseconds(1000)), absl::Milliseconds(300));
+  EXPECT_THAT(resp0, ArgType(RespExpr::NIL_ARRAY));
+}
+
+TEST_F(ZSetFamilyTest, ZDiffError) {
+  RespExpr resp;
+
+  resp = Run({"zdiff", "-1", "z1"});
+  EXPECT_THAT(resp, ErrArg("value is not an integer or out of range"));
+
+  resp = Run({"zdiff", "0"});
+  EXPECT_THAT(resp, ErrArg("wrong number of arguments"));
+
+  resp = Run({"zdiff", "0", "z1"});
+  EXPECT_THAT(resp, ErrArg("value is not an integer or out of range"));
+
+  resp = Run({"zdiff", "0", "z1", "z2"});
+  EXPECT_THAT(resp, ErrArg("value is not an integer or out of range"));
+}
+
+TEST_F(ZSetFamilyTest, ZDiff) {
+  RespExpr resp;
+
+  EXPECT_EQ(4, CheckedInt({"zadd", "z1", "1", "one", "2", "two", "3", "three", "4", "four"}));
+  EXPECT_EQ(2, CheckedInt({"zadd", "z2", "1", "one", "5", "five"}));
+  EXPECT_EQ(2, CheckedInt({"zadd", "z3", "2", "two", "3", "three"}));
+  EXPECT_EQ(1, CheckedInt({"zadd", "z4", "4", "four"}));
+
+  resp = Run({"zdiff", "1", "z1"});
+  EXPECT_THAT(resp.GetVec(), ElementsAre("one", "two", "three", "four"));
+
+  resp = Run({"zdiff", "2", "z1", "z1"});
+  EXPECT_THAT(resp.GetVec().empty(), true);
+
+  resp = Run({"zdiff", "2", "z1", "doesnt_exist"});
+  EXPECT_THAT(resp.GetVec(), ElementsAre("one", "two", "three", "four"));
+
+  resp = Run({"zdiff", "2", "z1", "z2"});
+  EXPECT_THAT(resp.GetVec(), ElementsAre("two", "three", "four"));
+
+  resp = Run({"zdiff", "2", "z1", "z3"});
+  EXPECT_THAT(resp.GetVec(), ElementsAre("one", "four"));
+
+  resp = Run({"zdiff", "4", "z1", "z2", "z3", "z4"});
+  EXPECT_THAT(resp.GetVec().empty(), true);
+
+  resp = Run({"zdiff", "2", "doesnt_exist", "key1"});
+  EXPECT_THAT(resp.GetVec().empty(), true);
+
+  // WITHSCORES
+  resp = Run({"zdiff", "1", "z1", "WITHSCORES"});
+  EXPECT_THAT(resp.GetVec(), ElementsAre("one", "1", "two", "2", "three", "3", "four", "4"));
+
+  resp = Run({"zdiff", "2", "z1", "z2", "WITHSCORES"});
+  EXPECT_THAT(resp.GetVec(), ElementsAre("two", "2", "three", "3", "four", "4"));
+}
+
 }  // namespace dfly

@@ -4,8 +4,6 @@
 
 #pragma once
 
-#include <absl/container/flat_hash_set.h>
-
 #include "facade/op_status.h"
 #include "server/common.h"
 #include "server/conn_context.h"
@@ -149,7 +147,8 @@ class DbSlice {
 
   // Returns (iterator, args-index) if found, KEY_NOTFOUND otherwise.
   // If multiple keys are found, returns the first index in the ArgSlice.
-  OpResult<std::pair<PrimeIterator, unsigned>> FindFirst(const Context& cntx, ArgSlice args);
+  OpResult<std::pair<PrimeIterator, unsigned>> FindFirst(const Context& cntx, ArgSlice args,
+                                                         int req_obj_type);
 
   // Return .second=true if insertion occurred, false if we return the existing key.
   // throws: bad_alloc is insertion could not happen due to out of memory.
@@ -209,7 +208,6 @@ class DbSlice {
    */
   void FlushDb(DbIndex db_ind);
 
-  using SlotSet = absl::flat_hash_set<SlotId>;
   // Flushes the data of given slot ids.
   void FlushSlots(SlotSet slot_ids);
 

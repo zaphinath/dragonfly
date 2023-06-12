@@ -8,6 +8,7 @@ extern "C" {
 #include "redis/zmalloc.h"
 }
 
+#include <absl/flags/reflection.h>
 #include <absl/strings/match.h>
 #include <absl/strings/str_split.h>
 #include <mimalloc.h>
@@ -62,16 +63,7 @@ TestConnection::TestConnection(Protocol protocol, io::StringSink* sink)
 }
 
 void TestConnection::SendPubMessageAsync(PubMessage pmsg) {
-  if (auto* ptr = std::get_if<PubMessage::MessageData>(&pmsg.data); ptr != nullptr) {
-    messages.push_back(move(*ptr));
-  } else if (auto* ptr = std::get_if<PubMessage::SubscribeData>(&pmsg.data); ptr != nullptr) {
-    RedisReplyBuilder builder(sink_);
-    const char* action[2] = {"unsubscribe", "subscribe"};
-    builder.StartArray(3);
-    builder.SendBulkString(action[ptr->add]);
-    builder.SendBulkString(ptr->channel);
-    builder.SendLong(ptr->channel_cnt);
-  }
+  messages.push_back(move(pmsg));
 }
 
 class BaseFamilyTest::TestConnWrapper {
@@ -84,7 +76,7 @@ class BaseFamilyTest::TestConnWrapper {
   RespVec ParseResponse(bool fully_consumed);
 
   // returns: type(pmessage), pattern, channel, message.
-  const facade::Connection::PubMessage::MessageData& GetPubMessage(size_t index) const;
+  const facade::Connection::PubMessage& GetPubMessage(size_t index) const;
 
   ConnectionContext* cmd_cntx() {
     return &cmd_cntx_;
@@ -196,6 +188,22 @@ RespExpr BaseFamilyTest::Run(ArgSlice list) {
   }
 
   return Run(GetId(), list);
+}
+
+RespExpr BaseFamilyTest::RunAdmin(std::initializer_list<const std::string_view> list) {
+  if (!ProactorBase::IsProactorThread()) {
+    return pp_->at(0)->Await([&] { return this->RunAdmin(list); });
+  }
+  string id = GetId();
+  TestConnWrapper* conn_wrapper = AddFindConn(Protocol::REDIS, id);
+  // Before running the command set the connection as admin connection
+  conn_wrapper->conn()->SetAdmin(true);
+  auto res = Run(id, ArgSlice{list.begin(), list.size()});
+  // After running the command set the connection as non admin connection
+  // because the connction is returned to the poll. This way the next call to Run from the same
+  // thread will not have the connection set as admin.
+  conn_wrapper->conn()->SetAdmin(false);
+  return res;
 }
 
 RespExpr BaseFamilyTest::Run(absl::Span<std::string> span) {
@@ -375,7 +383,7 @@ RespVec BaseFamilyTest::TestConnWrapper::ParseResponse(bool fully_consumed) {
   return res;
 }
 
-const facade::Connection::PubMessage::MessageData& BaseFamilyTest::TestConnWrapper::GetPubMessage(
+const facade::Connection::PubMessage& BaseFamilyTest::TestConnWrapper::GetPubMessage(
     size_t index) const {
   CHECK_LT(index, dummy_conn_->messages.size());
   return dummy_conn_->messages[index];
@@ -406,8 +414,8 @@ size_t BaseFamilyTest::SubscriberMessagesLen(string_view conn_id) const {
   return it->second->conn()->messages.size();
 }
 
-const facade::Connection::PubMessage::MessageData& BaseFamilyTest::GetPublishedMessage(
-    string_view conn_id, size_t index) const {
+const facade::Connection::PubMessage& BaseFamilyTest::GetPublishedMessage(string_view conn_id,
+                                                                          size_t index) const {
   auto it = connections_.find(conn_id);
   CHECK(it != connections_.end());
 
@@ -446,6 +454,13 @@ vector<string> BaseFamilyTest::StrArray(const RespExpr& expr) {
   }
 
   return res;
+}
+
+void BaseFamilyTest::SetTestFlag(string_view flag_name, string_view new_value) {
+  auto* flag = absl::FindCommandLineFlag(flag_name);
+  CHECK_NE(flag, nullptr);
+  string error;
+  CHECK(flag->ParseFrom(new_value, &error)) << "Error: " << error;
 }
 
 }  // namespace dfly

@@ -13,9 +13,11 @@ extern "C" {
 
 #include "base/logging.h"
 #include "facade/error.h"
+#include "server/blocking_controller.h"
 #include "server/command_registry.h"
 #include "server/conn_context.h"
 #include "server/engine_shard_set.h"
+#include "server/server_state.h"
 #include "server/transaction.h"
 
 namespace dfly {
@@ -34,8 +36,15 @@ using RecordVec = vector<Record>;
 
 struct ParsedStreamId {
   streamID val;
-  bool has_seq = false;   // Was an ID different than "ms-*" specified? for XADD only.
-  bool id_given = false;  // Was an ID different than "*" specified? for XADD only.
+
+  // Was an ID different than "ms-*" specified? for XADD only.
+  bool has_seq = false;
+  // Was an ID different than "*" specified? for XADD only.
+  bool id_given = false;
+
+  // Whether to lookup messages after the last ID in the stream. Used for XREAD
+  // when using ID '$'.
+  bool last_id = false;
 };
 
 struct RangeId {
@@ -44,18 +53,21 @@ struct RangeId {
 };
 
 enum class TrimStrategy {
-  kAddOptsTrimNone = TRIM_STRATEGY_NONE,
-  kAddOptsTrimMaxLen = TRIM_STRATEGY_MAXLEN,
-  kAddOptsTrimMinId = TRIM_STRATEGY_MINID,
+  kNone = TRIM_STRATEGY_NONE,
+  kMaxLen = TRIM_STRATEGY_MAXLEN,
+  kMinId = TRIM_STRATEGY_MINID,
 };
 
-struct AddOpts {
-  ParsedStreamId parsed_id;
+struct AddTrimOpts {
+  string_view key;
   ParsedStreamId minid;
   uint32_t max_len = kuint32max;
   uint32_t limit = 0;
-  TrimStrategy trim_strategy = TrimStrategy::kAddOptsTrimNone;
+  TrimStrategy trim_strategy = TrimStrategy::kNone;
   bool trim_approx = false;
+
+  // XADD only.
+  ParsedStreamId parsed_id;
   bool no_mkstream = false;
 };
 
@@ -71,6 +83,16 @@ struct RangeOpts {
   ParsedStreamId end;
   bool is_rev = false;
   uint32_t count = kuint32max;
+};
+
+struct ReadOpts {
+  // Contains a mapping from stream name to the starting stream ID.
+  unordered_map<string_view, ParsedStreamId> stream_ids;
+  // Contains the maximum number of entries to return for each stream.
+  uint32_t count = kuint32max;
+  // Contains the time to block waiting for entries, or -1 if should not block.
+  int64_t timeout = -1;
+  size_t streams_arg = 0;
 };
 
 const char kInvalidStreamId[] = "Invalid stream ID specified as stream command argument";
@@ -97,6 +119,11 @@ inline string StreamIdRepr(const streamID& id) {
 
 inline string NoGroupError(string_view key, string_view cgroup) {
   return absl::StrCat("-NOGROUP No such consumer group '", cgroup, "' for key name '", key, "'");
+}
+
+inline const uint8_t* SafePtr(MutableSlice field) {
+  return field.empty() ? reinterpret_cast<const uint8_t*>("")
+                       : reinterpret_cast<const uint8_t*>(field.data());
 }
 
 bool ParseID(string_view strid, bool strict, uint64_t missing_seq, ParsedStreamId* dest) {
@@ -375,7 +402,8 @@ int StreamAppendItem(stream* s, CmdArgList fields, streamID* added_id, streamID*
     lp = lpAppendInteger(lp, numfields);
     for (int64_t i = 0; i < numfields; i++) {
       MutableSlice field = fields[i * 2];
-      lp = lpAppend(lp, reinterpret_cast<const uint8_t*>(field.data()), field.size());
+
+      lp = lpAppend(lp, SafePtr(field), field.size());
     }
     lp = lpAppendInteger(lp, 0); /* Master entry zero terminator. */
     raxInsert(s->rax_tree, (unsigned char*)&rax_key, sizeof(rax_key), lp, NULL);
@@ -449,8 +477,8 @@ int StreamAppendItem(stream* s, CmdArgList fields, streamID* added_id, streamID*
   for (int64_t i = 0; i < numfields; i++) {
     MutableSlice field = fields[i * 2], value = fields[i * 2 + 1];
     if (!(flags & STREAM_ITEM_FLAG_SAMEFIELDS))
-      lp = lpAppend(lp, reinterpret_cast<const uint8_t*>(field.data()), field.size());
-    lp = lpAppend(lp, reinterpret_cast<const uint8_t*>(value.data()), value.size());
+      lp = lpAppend(lp, SafePtr(field), field.size());
+    lp = lpAppend(lp, SafePtr(value), value.size());
   }
   /* Compute and store the lp-count field. */
   int64_t lp_count = numfields;
@@ -475,14 +503,39 @@ int StreamAppendItem(stream* s, CmdArgList fields, streamID* added_id, streamID*
   return C_OK;
 }
 
-OpResult<streamID> OpAdd(const OpArgs& op_args, string_view key, const AddOpts& opts,
-                         CmdArgList args) {
+int StreamTrim(const AddTrimOpts& opts, stream* s) {
+  if (!opts.limit) {
+    if (opts.trim_strategy == TrimStrategy::kMaxLen) {
+      /* Notify xtrim event if needed. */
+      return streamTrimByLength(s, opts.max_len, opts.trim_approx);
+      // TODO: when replicating, we should propagate it as exact limit in case of trimming.
+    } else if (opts.trim_strategy == TrimStrategy::kMinId) {
+      return streamTrimByID(s, opts.minid.val, opts.trim_approx);
+    }
+  } else {
+    streamAddTrimArgs trim_args = {};
+    trim_args.trim_strategy = static_cast<int>(opts.trim_strategy);
+    trim_args.approx_trim = opts.trim_approx;
+    trim_args.limit = opts.limit;
+
+    if (opts.trim_strategy == TrimStrategy::kMaxLen) {
+      trim_args.maxlen = opts.max_len;
+    } else if (opts.trim_strategy == TrimStrategy::kMinId) {
+      trim_args.minid = opts.minid.val;
+    }
+    return streamTrim(s, &trim_args);
+  }
+
+  return 0;
+}
+
+OpResult<streamID> OpAdd(const OpArgs& op_args, const AddTrimOpts& opts, CmdArgList args) {
   DCHECK(!args.empty() && args.size() % 2 == 0);
   auto& db_slice = op_args.shard->db_slice();
   pair<PrimeIterator, bool> add_res;
 
   if (opts.no_mkstream) {
-    auto res_it = db_slice.Find(op_args.db_cntx, key, OBJ_STREAM);
+    auto res_it = db_slice.Find(op_args.db_cntx, opts.key, OBJ_STREAM);
     if (!res_it) {
       return res_it.status();
     }
@@ -490,7 +543,7 @@ OpResult<streamID> OpAdd(const OpArgs& op_args, string_view key, const AddOpts& 
     add_res.second = false;
   } else {
     try {
-      add_res = db_slice.AddOrFind(op_args.db_cntx, key);
+      add_res = db_slice.AddOrFind(op_args.db_cntx, opts.key);
     } catch (bad_alloc&) {
       return OpStatus::OUT_OF_MEMORY;
     }
@@ -527,27 +580,13 @@ OpResult<streamID> OpAdd(const OpArgs& op_args, string_view key, const AddOpts& 
     return OpStatus::OUT_OF_MEMORY;
   }
 
-  if (!opts.limit) {
-    if (opts.trim_strategy == TrimStrategy::kAddOptsTrimMaxLen) {
-      /* Notify xtrim event if needed. */
-      streamTrimByLength(stream_inst, opts.max_len, opts.trim_approx);
-      // TODO: when replicating, we should propagate it as exact limit in case of trimming.
-    } else if (opts.trim_strategy == TrimStrategy::kAddOptsTrimMinId) {
-      streamTrimByID(stream_inst, opts.minid.val, opts.trim_approx);
-    }
-  } else {
-    streamAddTrimArgs add_args = {
-        .trim_strategy = static_cast<int>(opts.trim_strategy),
-        .approx_trim = opts.trim_approx,
-        .limit = opts.limit,
-    };
-    if (opts.trim_strategy == TrimStrategy::kAddOptsTrimMaxLen) {
-      add_args.maxlen = opts.max_len;
-    } else if (opts.trim_strategy == TrimStrategy::kAddOptsTrimMinId) {
-      add_args.minid = opts.minid.val;
-    }
-    streamTrim(stream_inst, &add_args);
+  StreamTrim(opts, stream_inst);
+
+  EngineShard* es = op_args.shard;
+  if (es->blocking_controller()) {
+    es->blocking_controller()->AwakeWatched(op_args.db_cntx.db_index, opts.key);
   }
+
   return result_id;
 }
 
@@ -595,6 +634,63 @@ OpResult<RecordVec> OpRange(const OpArgs& op_args, string_view key, const RangeO
   streamIteratorStop(&si);
 
   return result;
+}
+
+// Returns a map of stream to the ID of the last entry in the stream. Any
+// streams not found are omitted from the result.
+OpResult<vector<pair<string_view, streamID>>> OpLastIDs(const OpArgs& op_args,
+                                                        const ArgSlice& args) {
+  DCHECK(!args.empty());
+
+  auto& db_slice = op_args.shard->db_slice();
+
+  vector<pair<string_view, streamID>> last_ids;
+  for (string_view key : args) {
+    OpResult<PrimeIterator> res_it = db_slice.Find(op_args.db_cntx, key, OBJ_STREAM);
+    if (!res_it) {
+      if (res_it.status() == OpStatus::KEY_NOTFOUND) {
+        continue;
+      }
+      return res_it.status();
+    }
+
+    CompactObj& cobj = (*res_it)->second;
+    stream* s = (stream*)cobj.RObjPtr();
+
+    streamID last_id;
+    streamLastValidID(s, &last_id);
+
+    last_ids.emplace_back(key, last_id);
+  }
+
+  return last_ids;
+}
+
+// Returns the range response for each stream on this shard in order of
+// GetShardArgs.
+vector<RecordVec> OpRead(const OpArgs& op_args, const ArgSlice& args, const ReadOpts& opts) {
+  DCHECK(!args.empty());
+
+  RangeOpts range_opts;
+  range_opts.count = opts.count;
+  range_opts.end = ParsedStreamId{.val = streamID{
+                                      .ms = UINT64_MAX,
+                                      .seq = UINT64_MAX,
+                                  }};
+
+  vector<RecordVec> response(args.size());
+  for (size_t i = 0; i < args.size(); ++i) {
+    string_view key = args[i];
+
+    range_opts.start = opts.stream_ids.at(key);
+
+    auto range_res = OpRange(op_args, key, range_opts);
+    if (range_res) {
+      response[i] = std::move(range_res.value());
+    }
+  }
+
+  return response;
 }
 
 OpResult<uint32_t> OpLen(const OpArgs& op_args, string_view key) {
@@ -952,54 +1048,103 @@ void XGroupHelp(CmdArgList args, ConnectionContext* cntx) {
   return (*cntx)->SendSimpleStrArr(help_arr);
 }
 
-}  // namespace
+OpResult<int64_t> OpTrim(const OpArgs& op_args, const AddTrimOpts& opts) {
+  auto* shard = op_args.shard;
+  auto& db_slice = shard->db_slice();
+  OpResult<PrimeIterator> res_it = db_slice.Find(op_args.db_cntx, opts.key, OBJ_STREAM);
+  if (!res_it) {
+    if (res_it.status() == OpStatus::KEY_NOTFOUND) {
+      return 0;
+    }
+    return res_it.status();
+  }
 
-void StreamFamily::XAdd(CmdArgList args, ConnectionContext* cntx) {
-  string_view key = ArgS(args, 0);
+  CompactObj& cobj = (*res_it)->second;
+  stream* s = (stream*)cobj.RObjPtr();
+
+  return StreamTrim(opts, s);
+}
+
+optional<pair<AddTrimOpts, unsigned>> ParseAddOrTrimArgsOrReply(CmdArgList args,
+                                                                ConnectionContext* cntx,
+                                                                bool is_xadd) {
+  AddTrimOpts opts;
+  opts.key = ArgS(args, 0);
+
   unsigned id_indx = 1;
-  AddOpts add_opts;
-
   for (; id_indx < args.size(); ++id_indx) {
     ToUpper(&args[id_indx]);
     string_view arg = ArgS(args, id_indx);
-    if (arg == "NOMKSTREAM") {
-      add_opts.no_mkstream = true;
-    } else if (arg == "MAXLEN" || arg == "MINID") {
-      if (arg == "MAXLEN") {
-        add_opts.trim_strategy = TrimStrategy::kAddOptsTrimMaxLen;
-      } else {
-        add_opts.trim_strategy = TrimStrategy::kAddOptsTrimMinId;
-      }
-      if (id_indx + 2 >= args.size()) {
-        return (*cntx)->SendError(kSyntaxErr);
-      }
-      ++id_indx;
-      if (ArgS(args, id_indx) == "~") {
-        add_opts.trim_approx = true;
-        ++id_indx;
-      }
-      arg = ArgS(args, id_indx);
-      if (add_opts.trim_strategy == TrimStrategy::kAddOptsTrimMaxLen &&
-          !absl::SimpleAtoi(arg, &add_opts.max_len)) {
-        return (*cntx)->SendError(kSyntaxErr);
-      }
-      if (add_opts.trim_strategy == TrimStrategy::kAddOptsTrimMinId &&
-          !ParseID(arg, false, 0, &add_opts.minid)) {
-        return (*cntx)->SendError(kSyntaxErr);
+
+    size_t remaining_args = args.size() - id_indx - 1;
+
+    if (is_xadd && arg == "NOMKSTREAM") {
+      opts.no_mkstream = true;
+    } else if ((arg == "MAXLEN" || arg == "MINID") && remaining_args >= 1) {
+      if (opts.trim_strategy != TrimStrategy::kNone) {
+        (*cntx)->SendError("MAXLEN and MINID options at the same time are not compatible",
+                           kSyntaxErr);
+        return std::nullopt;
       }
 
-    } else if (arg == "LIMIT" && add_opts.trim_strategy != TrimStrategy::kAddOptsTrimNone) {
-      if (id_indx + 2 >= args.size() || !add_opts.trim_approx) {
-        return (*cntx)->SendError(kSyntaxErr);
+      if (arg == "MAXLEN") {
+        opts.trim_strategy = TrimStrategy::kMaxLen;
+      } else {
+        opts.trim_strategy = TrimStrategy::kMinId;
+      }
+
+      id_indx++;
+      arg = ArgS(args, id_indx);
+      if (remaining_args >= 2 && arg == "~") {
+        opts.trim_approx = true;
+        id_indx++;
+        arg = ArgS(args, id_indx);
+      } else if (remaining_args >= 2 && arg == "=") {
+        opts.trim_approx = false;
+        id_indx++;
+        arg = ArgS(args, id_indx);
+      }
+
+      if (opts.trim_strategy == TrimStrategy::kMaxLen && !absl::SimpleAtoi(arg, &opts.max_len)) {
+        (*cntx)->SendError(kInvalidIntErr);
+        return std::nullopt;
+      }
+      if (opts.trim_strategy == TrimStrategy::kMinId && !ParseID(arg, false, 0, &opts.minid)) {
+        (*cntx)->SendError(kSyntaxErr);
+        return std::nullopt;
+      }
+    } else if (arg == "LIMIT" && remaining_args >= 1 && opts.trim_strategy != TrimStrategy::kNone) {
+      if (!opts.trim_approx) {
+        (*cntx)->SendError(kSyntaxErr);
+        return std::nullopt;
       }
       ++id_indx;
-      if (!absl::SimpleAtoi(ArgS(args, id_indx), &add_opts.limit)) {
-        return (*cntx)->SendError(kSyntaxErr);
+      if (!absl::SimpleAtoi(ArgS(args, id_indx), &opts.limit)) {
+        (*cntx)->SendError(kSyntaxErr);
+        return std::nullopt;
       }
-    } else {
+    } else if (is_xadd) {
+      // There are still remaining field args.
       break;
+    } else {
+      (*cntx)->SendError(kSyntaxErr);
+      return std::nullopt;
     }
   }
+
+  return make_pair(opts, id_indx);
+}
+
+}  // namespace
+
+void StreamFamily::XAdd(CmdArgList args, ConnectionContext* cntx) {
+  auto parse_resp = ParseAddOrTrimArgsOrReply(args, cntx, true);
+  if (!parse_resp) {
+    return;
+  }
+
+  auto add_opts = parse_resp->first;
+  auto id_indx = parse_resp->second;
 
   args.remove_prefix(id_indx);
   if (args.size() < 2 || args.size() % 2 == 0) {
@@ -1014,7 +1159,7 @@ void StreamFamily::XAdd(CmdArgList args, ConnectionContext* cntx) {
 
   args.remove_prefix(1);
   auto cb = [&](Transaction* t, EngineShard* shard) {
-    return OpAdd(t->GetOpArgs(shard), key, add_opts, args);
+    return OpAdd(t->GetOpArgs(shard), add_opts, args);
   };
 
   OpResult<streamID> add_result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
@@ -1121,13 +1266,17 @@ void StreamFamily::XInfo(CmdArgList args, ConnectionContext* cntx) {
       if (result) {
         (*cntx)->StartArray(result->size());
         for (const auto& ginfo : *result) {
-          absl::AlphaNum an1(ginfo.consumer_size);
-          absl::AlphaNum an2(ginfo.pending_size);
           string last_id = StreamIdRepr(ginfo.last_id);
-          string_view arr[8] = {"name",    ginfo.name,  "consumers",         an1.Piece(),
-                                "pending", an2.Piece(), "last-delivered-id", last_id};
 
-          (*cntx)->SendStringArr(absl::Span<string_view>{arr, 8}, RedisReplyBuilder::MAP);
+          (*cntx)->StartCollection(4, RedisReplyBuilder::MAP);
+          (*cntx)->SendBulkString("name");
+          (*cntx)->SendBulkString(ginfo.name);
+          (*cntx)->SendBulkString("consumers");
+          (*cntx)->SendLong(ginfo.consumer_size);
+          (*cntx)->SendBulkString("pending");
+          (*cntx)->SendLong(ginfo.pending_size);
+          (*cntx)->SendBulkString("last-delivered-id");
+          (*cntx)->SendBulkString(last_id);
         }
         return;
       }
@@ -1158,6 +1307,292 @@ void StreamFamily::XRevRange(CmdArgList args, ConnectionContext* cntx) {
   XRangeGeneric(std::move(args), true, cntx);
 }
 
+std::optional<ReadOpts> ParseReadArgsOrReply(CmdArgList args, ConnectionContext* cntx) {
+  size_t streams_count = 0;
+
+  ReadOpts opts;
+
+  for (size_t id_indx = 0; id_indx < args.size(); ++id_indx) {
+    ToUpper(&args[id_indx]);
+    string_view arg = ArgS(args, id_indx);
+
+    bool remaining_args = args.size() - id_indx - 1 > 0;
+    if (arg == "BLOCK" && remaining_args) {
+      id_indx++;
+      arg = ArgS(args, id_indx);
+      if (!absl::SimpleAtoi(arg, &opts.timeout)) {
+        (*cntx)->SendError(kInvalidIntErr);
+        return std::nullopt;
+      }
+    } else if (arg == "COUNT" && remaining_args) {
+      id_indx++;
+      arg = ArgS(args, id_indx);
+      if (!absl::SimpleAtoi(arg, &opts.count)) {
+        (*cntx)->SendError(kInvalidIntErr);
+        return std::nullopt;
+      }
+    } else if (arg == "STREAMS" && remaining_args) {
+      opts.streams_arg = id_indx + 1;
+
+      size_t pair_count = args.size() - opts.streams_arg;
+      if ((pair_count % 2) != 0) {
+        const auto m =
+            "Unbalanced 'XREAD' list of streams: for each stream key an ID must be specified";
+        (*cntx)->SendError(m, kSyntaxErr);
+        return std::nullopt;
+      }
+      streams_count = pair_count / 2;
+      break;
+    } else {
+      (*cntx)->SendError(kSyntaxErr);
+      return std::nullopt;
+    }
+  }
+
+  // STREAMS option is required.
+  if (opts.streams_arg == 0) {
+    (*cntx)->SendError(kSyntaxErr);
+    return std::nullopt;
+  }
+
+  // Parse the stream IDs.
+  for (size_t i = opts.streams_arg + streams_count; i < args.size(); i++) {
+    string_view key = ArgS(args, i - streams_count);
+    string_view idstr = ArgS(args, i);
+
+    ParsedStreamId id;
+
+    if (idstr == "$") {
+      // Set ID to 0 so if the ID cannot be resolved (when the stream doesn't
+      // exist) it takes the first entry added.
+      id.val.ms = 0;
+      id.val.seq = 0;
+      id.last_id = true;
+      opts.stream_ids.emplace(key, id);
+      continue;
+    }
+
+    if (idstr == ">") {
+      // XREADGROUP is not supported.
+      (*cntx)->SendError(
+          "The > ID can be specified only when calling XREADGROUP using the GROUP <group> "
+          "<consumer> option.",
+          kSyntaxErr);
+      return std::nullopt;
+    }
+
+    if (!ParseID(idstr, true, 0, &id)) {
+      (*cntx)->SendError(kInvalidStreamId, kSyntaxErrType);
+      return std::nullopt;
+    }
+
+    // We only include messages with IDs greater than start so increment the
+    // starting ID.
+    streamIncrID(&id.val);
+    opts.stream_ids.emplace(key, id);
+  }
+
+  return opts;
+}
+
+// Returns the last ID of each stream in the transaction.
+OpResult<unordered_map<string_view, streamID>> StreamLastIDs(Transaction* trans) {
+  vector<OpResult<vector<pair<string_view, streamID>>>> last_ids_res(shard_set->size());
+
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    ShardId sid = shard->shard_id();
+    last_ids_res[sid] = OpLastIDs(t->GetOpArgs(shard), t->GetShardArgs(shard->shard_id()));
+    return OpStatus::OK;
+  };
+  trans->Execute(std::move(cb), false);
+
+  unordered_map<string_view, streamID> last_ids;
+  for (auto res : last_ids_res) {
+    if (!res) {
+      return res.status();
+    }
+
+    for (auto& e : *res) {
+      last_ids.emplace(e.first, e.second);
+    }
+  }
+  return last_ids;
+}
+
+void XReadBlock(ReadOpts opts, ConnectionContext* cntx) {
+  // If BLOCK is not set just return an empty array as there are no resolvable
+  // entries.
+  if (opts.timeout == -1 || cntx->transaction->IsMulti()) {
+    // Close the transaction and release locks.
+    auto close_cb = [&](Transaction* t, EngineShard* shard) { return OpStatus::OK; };
+    cntx->transaction->Execute(std::move(close_cb), true);
+    return (*cntx)->SendNullArray();
+  }
+
+  auto wcb = [](Transaction* t, EngineShard* shard) { return t->GetShardArgs(shard->shard_id()); };
+
+  auto tp = (opts.timeout) ? chrono::steady_clock::now() + chrono::milliseconds(opts.timeout)
+                           : Transaction::time_point::max();
+
+  bool wait_succeeded = cntx->transaction->WaitOnWatch(tp, std::move(wcb));
+  if (!wait_succeeded) {
+    return (*cntx)->SendNullArray();
+  }
+
+  // Resolve the entry in the woken key. Note this must not use OpRead since
+  // only the shard that contains the woken key blocks for the awoken
+  // transaction to proceed.
+  OpResult<RecordVec> result;
+  std::string key;
+  auto range_cb = [&](Transaction* t, EngineShard* shard) {
+    if (auto wake_key = t->GetWakeKey(shard->shard_id()); wake_key) {
+      RangeOpts range_opts;
+      range_opts.end = ParsedStreamId{.val = streamID{
+                                          .ms = UINT64_MAX,
+                                          .seq = UINT64_MAX,
+                                      }};
+      range_opts.start = opts.stream_ids.at(*wake_key);
+      result = OpRange(t->GetOpArgs(shard), *wake_key, range_opts);
+      key = *wake_key;
+    }
+    return OpStatus::OK;
+  };
+  cntx->transaction->Execute(std::move(range_cb), true);
+
+  if (result) {
+    SinkReplyBuilder::ReplyAggregator agg(cntx->reply_builder());
+
+    (*cntx)->StartArray(1);
+
+    (*cntx)->StartArray(2);
+    (*cntx)->SendBulkString(key);
+
+    (*cntx)->StartArray(result->size());
+    for (const auto& item : *result) {
+      (*cntx)->StartArray(2);
+      (*cntx)->SendBulkString(StreamIdRepr(item.id));
+      (*cntx)->StartArray(item.kv_arr.size() * 2);
+      for (const auto& k_v : item.kv_arr) {
+        (*cntx)->SendBulkString(k_v.first);
+        (*cntx)->SendBulkString(k_v.second);
+      }
+    }
+    return;
+  } else {
+    return (*cntx)->SendNullArray();
+  }
+}
+
+void StreamFamily::XRead(CmdArgList args, ConnectionContext* cntx) {
+  auto opts = ParseReadArgsOrReply(args, cntx);
+  if (!opts) {
+    return;
+  }
+
+  cntx->transaction->Schedule();
+
+  auto last_ids = StreamLastIDs(cntx->transaction);
+  if (!last_ids) {
+    // Close the transaction.
+    auto close_cb = [&](Transaction* t, EngineShard* shard) { return OpStatus::OK; };
+    cntx->transaction->Execute(std::move(close_cb), true);
+
+    if (last_ids.status() == OpStatus::WRONG_TYPE) {
+      (*cntx)->SendError(kWrongTypeErr);
+      return;
+    }
+
+    return (*cntx)->SendNullArray();
+  }
+
+  // Resolve '$' IDs and check if there are any streams with entries that can
+  // be resolved without blocking.
+  bool block = true;
+  for (auto& [stream, requested_id] : opts->stream_ids) {
+    if (auto last_id_it = last_ids->find(stream); last_id_it != last_ids->end()) {
+      streamID last_id = last_id_it->second;
+
+      // Resolve $ to the last ID in the stream.
+      if (requested_id.last_id) {
+        requested_id.val = last_id;
+        // We only include messages with IDs greater than the last message so
+        // increment the ID.
+        streamIncrID(&requested_id.val);
+        requested_id.last_id = false;
+        continue;
+      }
+
+      if (streamCompareID(&last_id, &requested_id.val) >= 0) {
+        block = false;
+      }
+    }
+  }
+
+  if (block) {
+    return XReadBlock(*opts, cntx);
+  }
+
+  vector<vector<RecordVec>> xread_resp(shard_set->size());
+  auto read_cb = [&](Transaction* t, EngineShard* shard) {
+    ShardId sid = shard->shard_id();
+    xread_resp[sid] = OpRead(t->GetOpArgs(shard), t->GetShardArgs(shard->shard_id()), *opts);
+    return OpStatus::OK;
+  };
+  cntx->transaction->Execute(std::move(read_cb), true);
+
+  // Merge the results into a single response ordered by stream.
+  vector<RecordVec> res(opts->stream_ids.size());
+  // Track the number of streams with records as empty streams are excluded from
+  // the response.
+  int resolved_streams = 0;
+  for (ShardId sid = 0; sid < shard_set->size(); ++sid) {
+    if (!cntx->transaction->IsActive(sid))
+      continue;
+
+    vector<RecordVec>& results = xread_resp[sid];
+
+    ArgSlice slice = cntx->transaction->GetShardArgs(sid);
+
+    DCHECK(!slice.empty());
+    DCHECK_EQ(slice.size(), results.size());
+
+    for (size_t i = 0; i < slice.size(); ++i) {
+      if (results[i].size() == 0) {
+        continue;
+      }
+
+      resolved_streams++;
+
+      // Add the stream records ordered by the original stream arguments.
+      size_t indx = cntx->transaction->ReverseArgIndex(sid, i);
+      res[indx - opts->streams_arg] = std::move(results[i]);
+    }
+  }
+
+  SinkReplyBuilder::ReplyAggregator agg(cntx->reply_builder());
+
+  (*cntx)->StartArray(resolved_streams);
+  for (size_t i = 0; i != res.size(); i++) {
+    // Ignore empty streams.
+    if (res[i].size() == 0) {
+      continue;
+    }
+
+    (*cntx)->StartArray(2);
+    (*cntx)->SendBulkString(ArgS(args, i + opts->streams_arg));
+    (*cntx)->StartArray(res[i].size());
+    for (const auto& item : res[i]) {
+      (*cntx)->StartArray(2);
+      (*cntx)->SendBulkString(StreamIdRepr(item.id));
+      (*cntx)->StartArray(item.kv_arr.size() * 2);
+      for (const auto& k_v : item.kv_arr) {
+        (*cntx)->SendBulkString(k_v.first);
+        (*cntx)->SendBulkString(k_v.second);
+      }
+    }
+  }
+}
+
 void StreamFamily::XSetId(CmdArgList args, ConnectionContext* cntx) {
   string_view key = ArgS(args, 0);
   string_view idstr = ArgS(args, 1);
@@ -1183,6 +1618,25 @@ void StreamFamily::XSetId(CmdArgList args, ConnectionContext* cntx) {
     default:
       return (*cntx)->SendError(result);
   }
+}
+
+void StreamFamily::XTrim(CmdArgList args, ConnectionContext* cntx) {
+  auto parse_resp = ParseAddOrTrimArgsOrReply(args, cntx, true);
+  if (!parse_resp) {
+    return;
+  }
+
+  auto trim_opts = parse_resp->first;
+
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    return OpTrim(t->GetOpArgs(shard), trim_opts);
+  };
+
+  OpResult<int64_t> trim_result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  if (trim_result) {
+    return (*cntx)->SendLong(*trim_result);
+  }
+  return (*cntx)->SendError(trim_result.status());
 }
 
 void StreamFamily::XRangeGeneric(CmdArgList args, bool is_rev, ConnectionContext* cntx) {
@@ -1227,6 +1681,8 @@ void StreamFamily::XRangeGeneric(CmdArgList args, bool is_rev, ConnectionContext
   OpResult<RecordVec> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
 
   if (result) {
+    SinkReplyBuilder::ReplyAggregator agg(cntx->reply_builder());
+
     (*cntx)->StartArray(result->size());
     for (const auto& item : *result) {
       (*cntx)->StartArray(2);
@@ -1258,7 +1714,10 @@ void StreamFamily::Register(CommandRegistry* registry) {
             << CI{"XLEN", CO::READONLY | CO::FAST, 2, 1, 1, 1}.HFUNC(XLen)
             << CI{"XRANGE", CO::READONLY, -4, 1, 1, 1}.HFUNC(XRange)
             << CI{"XREVRANGE", CO::READONLY, -4, 1, 1, 1}.HFUNC(XRevRange)
+            << CI{"XREAD", CO::READONLY | CO::REVERSE_MAPPING | CO::VARIADIC_KEYS, -3, 3, 3, 1}
+                   .HFUNC(XRead)
             << CI{"XSETID", CO::WRITE | CO::DENYOOM, 3, 1, 1, 1}.HFUNC(XSetId)
+            << CI{"XTRIM", CO::WRITE | CO::FAST, -4, 1, 1, 1}.HFUNC(XTrim)
             << CI{"_XGROUP_HELP", CO::NOSCRIPT | CO::HIDDEN, 2, 0, 0, 0}.SetHandler(XGroupHelp);
 }
 

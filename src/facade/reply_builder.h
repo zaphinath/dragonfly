@@ -86,11 +86,39 @@ class SinkReplyBuilder {
     return err_count_;
   }
 
+  struct ReplyAggregator {
+    explicit ReplyAggregator(SinkReplyBuilder* builder) : builder_(builder) {
+      // If the builder is already aggregating then don't aggregate again as
+      // this will cause redundant sink writes (such as in a MULTI/EXEC).
+      if (builder->should_aggregate_) {
+        return;
+      }
+      builder_->StartAggregate();
+      is_nested_ = false;
+    }
+
+    ~ReplyAggregator() {
+      if (!is_nested_) {
+        builder_->StopAggregate();
+      }
+    }
+
+   private:
+    SinkReplyBuilder* builder_;
+    bool is_nested_ = true;
+  };
+
  protected:
   void SendRaw(std::string_view str);  // Sends raw without any formatting.
   void SendRawVec(absl::Span<const std::string_view> msg_vec);
 
   void Send(const iovec* v, uint32_t len);
+
+  void StartAggregate() {
+    should_aggregate_ = true;
+  }
+
+  void StopAggregate();
 
   std::string batch_;
   ::io::Sink* sink_;
@@ -100,10 +128,15 @@ class SinkReplyBuilder {
   size_t io_write_bytes_ = 0;
   absl::flat_hash_map<std::string, uint64_t> err_count_;
 
-  bool should_batch_ = false;
+  bool should_batch_ : 1;
+
+  // Similarly to batch mode but is controlled by at operation level.
+  bool should_aggregate_ : 1;
 };
 
 class MCReplyBuilder : public SinkReplyBuilder {
+  bool noreply_;
+
  public:
   MCReplyBuilder(::io::Sink* stream);
 
@@ -121,6 +154,10 @@ class MCReplyBuilder : public SinkReplyBuilder {
   void SendClientError(std::string_view str);
   void SendNotFound();
   void SendSimpleString(std::string_view str) final;
+
+  void SetNoreply(bool noreply) {
+    noreply_ = noreply;
+  }
 };
 
 class RedisReplyBuilder : public SinkReplyBuilder {
@@ -155,6 +192,7 @@ class RedisReplyBuilder : public SinkReplyBuilder {
                                bool with_scores);
 
   void StartArray(unsigned len);  // StartCollection(len, ARRAY)
+
   virtual void StartCollection(unsigned len, CollectionType type);
 
   static char* FormatDouble(double val, char* dest, unsigned dest_len);

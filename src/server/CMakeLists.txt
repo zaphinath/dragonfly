@@ -16,13 +16,15 @@ cxx_link(dfly_transaction dfly_core strings_lib)
 
 add_library(dragonfly_lib channel_store.cc command_registry.cc
             config_flags.cc conn_context.cc debugcmd.cc dflycmd.cc
-            generic_family.cc hset_family.cc json_family.cc search_family.cc
+            generic_family.cc hset_family.cc json_family.cc
+            search/search_family.cc search/doc_index.cc search/doc_accessors.cc
             list_family.cc main_service.cc memory_cmd.cc rdb_load.cc rdb_save.cc replica.cc
             snapshot.cc script_mgr.cc server_family.cc malloc_stats.cc
             set_family.cc stream_family.cc string_family.cc
             zset_family.cc version.cc bitops_family.cc container_utils.cc io_utils.cc
             serializer_commons.cc journal/serializer.cc journal/executor.cc journal/streamer.cc
-            top_keys.cc multi_command_squasher.cc hll_family.cc cluster/cluster_config.cc)
+            top_keys.cc multi_command_squasher.cc hll_family.cc cluster/cluster_config.cc
+            cluster/cluster_family.cc)
 
 
 cxx_link(dragonfly_lib dfly_transaction dfly_facade redis_lib aws_lib strings_lib html_lib
@@ -50,13 +52,13 @@ cxx_test(zset_family_test dfly_test_lib LABELS DFLY)
 cxx_test(blocking_controller_test dragonfly_lib LABELS DFLY)
 cxx_test(snapshot_test dragonfly_lib LABELS DFLY)
 cxx_test(json_family_test dfly_test_lib LABELS DFLY)
-cxx_test(journal_test dfly_test_lib LABELS DFLY)
+cxx_test(journal/journal_test dfly_test_lib LABELS DFLY)
 cxx_test(tiered_storage_test dfly_test_lib LABELS DFLY)
 cxx_test(top_keys_test dfly_test_lib LABELS DFLY)
 cxx_test(hll_family_test dfly_test_lib LABELS DFLY)
-cxx_test(search_family_test dfly_test_lib LABELS DFLY)
-cxx_test(cluster_config_test dfly_test_lib LABELS DFLY)
-cxx_test(dflycmd_test dfly_test_lib LABELS DFLY)
+cxx_test(search/search_family_test dfly_test_lib LABELS DFLY)
+cxx_test(cluster/cluster_config_test dfly_test_lib LABELS DFLY)
+cxx_test(cluster/cluster_family_test dfly_test_lib LABELS DFLY)
 
 
 
@@ -64,4 +66,5 @@ add_custom_target(check_dfly WORKING_DIRECTORY .. COMMAND ctest -L DFLY)
 add_dependencies(check_dfly dragonfly_test json_family_test list_family_test
                  generic_family_test memcache_parser_test rdb_test journal_test
                  redis_parser_test snapshot_test stream_family_test string_family_test
-                 bitops_family_test set_family_test zset_family_test hll_family_test cluster_config_test)
+                 bitops_family_test set_family_test zset_family_test hll_family_test
+                 cluster_config_test cluster_family_test)

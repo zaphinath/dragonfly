@@ -23,10 +23,18 @@ class TestConnection : public facade::Connection {
 
   void SendPubMessageAsync(PubMessage pmsg) final;
 
-  std::vector<PubMessage::MessageData> messages;
+  bool IsAdmin() const override {
+    return is_admin_;
+  }
+  void SetAdmin(bool is_admin) {
+    is_admin_ = is_admin;
+  }
+
+  std::vector<PubMessage> messages;
 
  private:
   io::StringSink* sink_;
+  bool is_admin_ = false;
 };
 
 class BaseFamilyTest : public ::testing::Test {
@@ -45,6 +53,10 @@ class BaseFamilyTest : public ::testing::Test {
   RespExpr Run(std::initializer_list<const std::string_view> list) {
     return Run(ArgSlice{list.begin(), list.size()});
   }
+
+  // Runs the command in a mocked admin connection
+  // Use for running commands which are allowed only when using admin connection.
+  RespExpr RunAdmin(std::initializer_list<const std::string_view> list);
 
   RespExpr Run(ArgSlice list);
   RespExpr Run(absl::Span<std::string> list);
@@ -87,10 +99,12 @@ class BaseFamilyTest : public ::testing::Test {
   std::string GetId() const;
   size_t SubscriberMessagesLen(std::string_view conn_id) const;
 
-  const facade::Connection::PubMessage::MessageData& GetPublishedMessage(std::string_view conn_id,
-                                                                         size_t index) const;
+  const facade::Connection::PubMessage& GetPublishedMessage(std::string_view conn_id,
+                                                            size_t index) const;
 
   static unsigned NumLocked();
+
+  void SetTestFlag(std::string_view flag_name, std::string_view new_value);
 
   std::unique_ptr<util::ProactorPool> pp_;
   std::unique_ptr<Service> service_;

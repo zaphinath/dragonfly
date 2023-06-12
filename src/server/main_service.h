@@ -7,6 +7,7 @@
 #include "base/varz_value.h"
 #include "core/interpreter.h"
 #include "facade/service_interface.h"
+#include "server/cluster/cluster_family.h"
 #include "server/command_registry.h"
 #include "server/engine_shard_set.h"
 #include "server/server_family.h"
@@ -107,6 +108,8 @@ class Service : public facade::ServiceInterface {
   void Function(CmdArgList args, ConnectionContext* cntx);
   void Monitor(CmdArgList args, ConnectionContext* cntx);
   void Pubsub(CmdArgList args, ConnectionContext* cntx);
+  void Command(CmdArgList args, ConnectionContext* cntx);
+
   void PubsubChannels(std::string_view pattern, ConnectionContext* cntx);
   void PubsubPatterns(ConnectionContext* cntx);
 
@@ -139,6 +142,7 @@ class Service : public facade::ServiceInterface {
   util::ProactorPool& pp_;
 
   ServerFamily server_family_;
+  ClusterFamily cluster_family_;
   CommandRegistry registry_;
   absl::flat_hash_map<std::string, unsigned> unknown_cmds_;
 

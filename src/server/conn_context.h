@@ -11,12 +11,14 @@
 #include "facade/conn_context.h"
 #include "facade/reply_capture.h"
 #include "server/common.h"
+#include "server/version.h"
 
 namespace dfly {
 
 class EngineShardSet;
 class ConnectionContext;
 class ChannelStore;
+class FlowInfo;
 
 // Stores command id and arguments for delayed invocation.
 // Used for storing MULTI/EXEC commands.
@@ -85,7 +87,6 @@ struct ConnectionState {
 
   // Lua-script related data.
   struct ScriptInfo {
-    bool is_write = true;
     absl::flat_hash_set<std::string_view> keys;  // declared keys
 
     size_t async_cmds_heap_mem = 0;     // bytes used by async_cmds
@@ -116,6 +117,7 @@ struct ConnectionState {
     uint32_t repl_session_id = 0;
     uint32_t repl_flow_id = UINT32_MAX;
     uint32_t repl_listening_port = 0;
+    DflyVersion repl_version = DflyVersion::VER0;
   };
 
   enum MCGetMask {
@@ -170,13 +172,16 @@ class ConnectionContext : public facade::ConnectionContext {
   void PUnsubscribeAll(bool to_reply);
   void ChangeMonitor(bool start);  // either start or stop monitor on a given connection
 
+  // Whether this connection is a connection from a replica to its master.
   bool is_replicating = false;
+  // Reference to a FlowInfo for this connection if from a master to a replica.
+  FlowInfo* replication_flow;
   bool monitor = false;  // when a monitor command is sent over a given connection, we need to aware
                          // of it as a state for the connection
 
  private:
   void EnableMonitoring(bool enable) {
-    force_dispatch = enable;  // required to support the monitoring
+    subscriptions++;  // required to support the monitoring
     monitor = enable;
   }
   void SendSubscriptionChangedResponse(std::string_view action,

@@ -102,18 +102,14 @@ struct Connection::Shutdown {
 
 Connection::PubMessage::PubMessage(string pattern, shared_ptr<char[]> buf, size_t channel_len,
                                    size_t message_len)
-    : data{MessageData{pattern, move(buf), channel_len, message_len}} {
+    : pattern{move(pattern)}, buf{move(buf)}, channel_len{channel_len}, message_len{message_len} {
 }
 
-Connection::PubMessage::PubMessage(bool add, string_view channel, uint32_t channel_cnt)
-    : data{SubscribeData{add, string{channel}, channel_cnt}} {
-}
-
-string_view Connection::PubMessage::MessageData::Channel() const {
+string_view Connection::PubMessage::Channel() const {
   return {buf.get(), channel_len};
 }
 
-string_view Connection::PubMessage::MessageData::Message() const {
+string_view Connection::PubMessage::Message() const {
   return {buf.get() + channel_len, message_len};
 }
 
@@ -179,8 +175,7 @@ template <class... Ts> Overloaded(Ts...) -> Overloaded<Ts...>;
 size_t Connection::MessageHandle::UsedMemory() const {
   // TODO: don't count inline size
   auto pub_size = [](const PubMessage& msg) -> size_t {
-    const auto* md = get_if<PubMessage::MessageData>(&msg.data);
-    return sizeof(PubMessage) + (md ? (md->channel_len + md->message_len) : 0u);
+    return sizeof(PubMessage) + (msg.channel_len + msg.message_len);
   };
   auto msg_size = [](const PipelineMessage& arg) -> size_t {
     return sizeof(PipelineMessage) + arg.args.capacity() * sizeof(MutableSlice) +
@@ -202,28 +197,18 @@ void Connection::DispatchOperations::operator()(const MonitorMessage& msg) {
 void Connection::DispatchOperations::operator()(const PubMessage& pub_msg) {
   RedisReplyBuilder* rbuilder = (RedisReplyBuilder*)builder;
   ++stats->async_writes_cnt;
-  auto send_msg = [rbuilder](const PubMessage::MessageData& data) {
-    unsigned i = 0;
-    string_view arr[4];
-    if (data.pattern.empty()) {
-      arr[i++] = "message";
-    } else {
-      arr[i++] = "pmessage";
-      arr[i++] = data.pattern;
-    }
-    arr[i++] = data.Channel();
-    arr[i++] = data.Message();
-    rbuilder->SendStringArr(absl::Span<string_view>{arr, i},
-                            RedisReplyBuilder::CollectionType::PUSH);
-  };
-  auto send_sub = [rbuilder](const PubMessage::SubscribeData& data) {
-    const char* action[2] = {"unsubscribe", "subscribe"};
-    rbuilder->StartCollection(3, RedisReplyBuilder::CollectionType::PUSH);
-    rbuilder->SendBulkString(action[data.add]);
-    rbuilder->SendBulkString(data.channel);
-    rbuilder->SendLong(data.channel_cnt);
-  };
-  visit(Overloaded{send_msg, send_sub}, pub_msg.data);
+  unsigned i = 0;
+  array<string_view, 4> arr;
+  if (pub_msg.pattern.empty()) {
+    arr[i++] = "message";
+  } else {
+    arr[i++] = "pmessage";
+    arr[i++] = pub_msg.pattern;
+  }
+  arr[i++] = pub_msg.Channel();
+  arr[i++] = pub_msg.Message();
+  rbuilder->SendStringArr(absl::Span<string_view>{arr.data(), i},
+                          RedisReplyBuilder::CollectionType::PUSH);
 }
 
 void Connection::DispatchOperations::operator()(Connection::PipelineMessage& msg) {
@@ -231,10 +216,8 @@ void Connection::DispatchOperations::operator()(Connection::PipelineMessage& msg
 
   DVLOG(2) << "Dispatching pipeline: " << ToSV(msg.args.front());
 
-  self->cc_->async_dispatch = true;
   self->service_->DispatchCommand(CmdArgList{msg.args.data(), msg.args.size()}, self->cc_.get());
   self->last_interaction_ = time(nullptr);
-  self->cc_->async_dispatch = false;
 }
 
 Connection::Connection(Protocol protocol, util::HttpListenerBase* http_listener, SSL_CTX* ctx,
@@ -317,7 +300,7 @@ void Connection::HandleRequests() {
 
   if (absl::GetFlag(FLAGS_tcp_nodelay)) {
     int val = 1;
-    CHECK_EQ(0, setsockopt(lsb->native_handle(), SOL_TCP, TCP_NODELAY, &val, sizeof(val)));
+    CHECK_EQ(0, setsockopt(lsb->native_handle(), IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val)));
   }
 
   auto remote_ep = lsb->RemoteEndpoint();
@@ -474,24 +457,25 @@ void Connection::ConnectionFlow(FiberSocketBase* peer) {
   stats_->read_buf_capacity += io_buf_.Capacity();
 
   ParserStatus parse_status = OK;
+  SinkReplyBuilder* orig_builder = cc_->reply_builder();
 
   // At the start we read from the socket to determine the HTTP/Memstore protocol.
   // Therefore we may already have some data in the buffer.
   if (io_buf_.InputLen() > 0) {
     phase_ = PROCESS;
     if (redis_parser_) {
-      parse_status = ParseRedis();
+      parse_status = ParseRedis(orig_builder);
     } else {
       DCHECK(memcache_parser_);
       parse_status = ParseMemcache();
     }
   }
 
-  error_code ec = cc_->reply_builder()->GetError();
+  error_code ec = orig_builder->GetError();
 
   // Main loop.
   if (parse_status != ERROR && !ec) {
-    auto res = IoLoop(peer);
+    auto res = IoLoop(peer, orig_builder);
 
     if (holds_alternative<error_code>(res)) {
       ec = get<error_code>(res);
@@ -542,11 +526,47 @@ void Connection::ConnectionFlow(FiberSocketBase* peer) {
   --stats_->num_conns;
 }
 
-auto Connection::ParseRedis() -> ParserStatus {
+void Connection::DispatchCommand(uint32_t consumed, mi_heap_t* heap) {
+  bool can_dispatch_sync = (consumed >= io_buf_.InputLen());
+
+  // Avoid sync dispatch if an async dispatch is already in progress, or else they'll interleave.
+  if (cc_->async_dispatch)
+    can_dispatch_sync = false;
+
+  // Avoid sync dispatch if we already have pending async messages or
+  // can potentially receive some (subscriptions > 0). Otherwise the dispatch
+  // fiber might be constantly blocked by sync_dispatch.
+  if (dispatch_q_.size() > 0 || cc_->subscriptions > 0)
+    can_dispatch_sync = false;
+
+  if (can_dispatch_sync) {
+    ShrinkPipelinePool();  // Gradually release pipeline request pool.
+
+    RespToArgList(tmp_parse_args_, &tmp_cmd_vec_);
+
+    {
+      cc_->sync_dispatch = true;
+      service_->DispatchCommand(absl::MakeSpan(tmp_cmd_vec_), cc_.get());
+      cc_->sync_dispatch = false;
+    }
+
+    last_interaction_ = time(nullptr);
+
+    // We might have blocked the dispatch queue from processing, wake it up.
+    if (dispatch_q_.size() > 0)
+      evc_.notify();
+
+  } else {
+    SendAsync(MessageHandle{FromArgs(move(tmp_parse_args_), heap)});
+    if (dispatch_q_.size() > 10)
+      ThisFiber::Yield();
+  }
+}
+
+Connection::ParserStatus Connection::ParseRedis(SinkReplyBuilder* orig_builder) {
   uint32_t consumed = 0;
 
   RedisParser::Result result = RedisParser::OK;
-  SinkReplyBuilder* builder = cc_->reply_builder();
   mi_heap_t* tlh = mi_heap_get_backing();
 
   do {
@@ -558,31 +578,10 @@ auto Connection::ParseRedis() -> ParserStatus {
         DVLOG(2) << "Got Args with first token " << ToSV(first.GetBuf());
       }
 
-      // An optimization to skip dispatch_q_ if no pipelining is identified.
-      // We use ASYNC_DISPATCH as a lock to avoid out-of-order replies when the
-      // dispatch fiber pulls the last record but is still processing the command and then this
-      // fiber enters the condition below and executes out of order.
-      bool is_sync_dispatch = !cc_->async_dispatch && !cc_->force_dispatch;
-      if (dispatch_q_.empty() && is_sync_dispatch && consumed >= io_buf_.InputLen()) {
-        // Gradually release the request pool.
-        ShrinkPipelinePool();
-
-        RespToArgList(tmp_parse_args_, &tmp_cmd_vec_);
-
-        DVLOG(2) << "Sync dispatch " << ToSV(tmp_cmd_vec_.front());
-
-        CmdArgList cmd_list{tmp_cmd_vec_.data(), tmp_cmd_vec_.size()};
-        service_->DispatchCommand(cmd_list, cc_.get());
-        last_interaction_ = time(nullptr);
-      } else {
-        // Dispatch via queue to speedup input reading.
-        SendAsync(MessageHandle{FromArgs(move(tmp_parse_args_), tlh)});
-        if (dispatch_q_.size() > 10)
-          ThisFiber::Yield();
-      }
+      DispatchCommand(consumed, tlh);
     }
     io_buf_.ConsumeInput(consumed);
-  } while (RedisParser::OK == result && !builder->GetError());
+  } while (RedisParser::OK == result && !orig_builder->GetError());
 
   parser_error_ = result;
   if (result == RedisParser::OK)
@@ -662,13 +661,13 @@ void Connection::OnBreakCb(int32_t mask) {
   evc_.notify();  // Notify dispatch fiber.
 }
 
-auto Connection::IoLoop(util::FiberSocketBase* peer) -> variant<error_code, ParserStatus> {
-  SinkReplyBuilder* builder = cc_->reply_builder();
+auto Connection::IoLoop(util::FiberSocketBase* peer, SinkReplyBuilder* orig_builder)
+    -> variant<error_code, ParserStatus> {
   error_code ec;
   ParserStatus parse_status = OK;
 
   do {
-    FetchBuilderStats(stats_, builder);
+    FetchBuilderStats(stats_, orig_builder);
 
     io::MutableBytes append_buf = io_buf_.AppendBuffer();
     phase_ = READ_SOCKET;
@@ -688,7 +687,7 @@ auto Connection::IoLoop(util::FiberSocketBase* peer) -> variant<error_code, Pars
     phase_ = PROCESS;
 
     if (redis_parser_) {
-      parse_status = ParseRedis();
+      parse_status = ParseRedis(orig_builder);
     } else {
       DCHECK(memcache_parser_);
       parse_status = ParseMemcache();
@@ -718,10 +717,10 @@ auto Connection::IoLoop(util::FiberSocketBase* peer) -> variant<error_code, Pars
     } else if (parse_status != OK) {
       break;
     }
-    ec = builder->GetError();
+    ec = orig_builder->GetError();
   } while (peer->IsOpen() && !ec);
 
-  FetchBuilderStats(stats_, builder);
+  FetchBuilderStats(stats_, orig_builder);
 
   if (ec)
     return ec;
@@ -742,7 +741,8 @@ void Connection::DispatchFiber(util::FiberSocketBase* peer) {
   uint64_t request_cache_limit = absl::GetFlag(FLAGS_request_cache_limit);
 
   while (!builder->GetError()) {
-    evc_.await([this] { return cc_->conn_closing || !dispatch_q_.empty(); });
+    evc_.await(
+        [this] { return cc_->conn_closing || (!dispatch_q_.empty() && !cc_->sync_dispatch); });
     if (cc_->conn_closing)
       break;
 
@@ -751,11 +751,16 @@ void Connection::DispatchFiber(util::FiberSocketBase* peer) {
 
     builder->SetBatchMode(dispatch_q_.size() > 0);
 
-    std::visit(dispatch_op, msg.handle);
+    {
+      cc_->async_dispatch = true;
+      std::visit(dispatch_op, msg.handle);
+      cc_->async_dispatch = false;
+    }
 
     dispatch_q_bytes_.fetch_sub(msg.UsedMemory(), memory_order_relaxed);
     evc_bp_.notify();
 
+    // Retain pipeline message in pool.
     if (auto* pipe = get_if<PipelineMessagePtr>(&msg.handle); pipe) {
       if (stats_->pipeline_cache_capacity < request_cache_limit) {
         stats_->pipeline_cache_capacity += (*pipe)->StorageCapacity();
@@ -832,6 +837,10 @@ void Connection::ShutdownThreadLocal() {
   pipeline_req_pool_.clear();
 }
 
+bool Connection::IsCurrentlyDispatching() const {
+  return cc_->async_dispatch || cc_->sync_dispatch;
+}
+
 void RespToArgList(const RespVec& src, CmdArgVec* dest) {
   dest->resize(src.size());
   for (size_t i = 0; i < src.size(); ++i) {
@@ -859,7 +868,12 @@ void Connection::SendAsync(MessageHandle msg) {
   dispatch_q_bytes_.fetch_add(msg.UsedMemory(), memory_order_relaxed);
 
   dispatch_q_.push_back(move(msg));
-  if (dispatch_q_.size() == 1) {
+
+  // Don't notify if a sync dispatch is in progress, it will wake after finishing.
+  // This might only happen if we started receving messages while `SUBSCRIBE`
+  // is still updating thread local data (see channel_store). We need to make sure its
+  // ack is sent before all other messages.
+  if (dispatch_q_.size() == 1 && !cc_->sync_dispatch) {
     evc_.notify();
   }
 }

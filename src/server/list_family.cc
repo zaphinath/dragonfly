@@ -128,102 +128,34 @@ bool ElemCompare(const quicklistEntry& entry, string_view elem) {
   return elem == an.Piece();
 }
 
-using FFResult = pair<PrimeKey, unsigned>;  // key, argument index.
+// Circular buffer for string messages
+struct CircularMessages {
+  CircularMessages(size_t size) : current{0}, messages{size} {
+  }
 
-struct ShardFFResult {
-  PrimeKey key;
-  ShardId sid = kInvalidSid;
+  string* Next() {
+    string* next = &messages[current];
+    current = (current + 1) % messages.size();
+    next->clear();
+    return next;
+  }
+
+  vector<string> All() {
+    vector<string> out;
+    out.insert(out.end(), messages.begin() + current, messages.end());
+    out.insert(out.end(), messages.begin(), messages.begin() + current);
+    out.erase(std::remove_if(out.begin(), out.end(), [&](const auto& msg) { return msg.empty(); }),
+              out.end());
+    return out;
+  }
+
+  int current = 0;
+  vector<string> messages;
 };
 
-// Used by bpopper.
-OpResult<ShardFFResult> FindFirst(Transaction* trans) {
-  VLOG(2) << "FindFirst::Find " << trans->DebugId();
-
-  // Holds Find results: (iterator to a found key, and its index in the passed arguments).
-  // See DbSlice::FindFirst for more details.
-  // spans all the shards for now.
-  std::vector<OpResult<FFResult>> find_res(shard_set->size());
-  fill(find_res.begin(), find_res.end(), OpStatus::KEY_NOTFOUND);
-
-  auto cb = [&](Transaction* t, EngineShard* shard) {
-    auto args = t->GetShardArgs(shard->shard_id());
-
-    OpResult<pair<PrimeIterator, unsigned>> ff_res =
-        shard->db_slice().FindFirst(t->GetDbContext(), args);
-
-    if (ff_res) {
-      FFResult ff_result(ff_res->first->first.AsRef(), ff_res->second);
-      find_res[shard->shard_id()] = move(ff_result);
-    } else {
-      find_res[shard->shard_id()] = ff_res.status();
-    }
-
-    return OpStatus::OK;
-  };
-
-  trans->Execute(move(cb), false);
-
-  uint32_t min_arg_indx = UINT32_MAX;
-
-  ShardFFResult shard_result;
-
-  for (size_t sid = 0; sid < find_res.size(); ++sid) {
-    const auto& fr = find_res[sid];
-    auto status = fr.status();
-    if (status == OpStatus::KEY_NOTFOUND)
-      continue;
-
-    if (status == OpStatus::WRONG_TYPE) {
-      return status;
-    }
-
-    CHECK(fr);
-
-    const auto& it_pos = fr.value();
-
-    size_t arg_indx = trans->ReverseArgIndex(sid, it_pos.second);
-    if (arg_indx < min_arg_indx) {
-      min_arg_indx = arg_indx;
-      shard_result.sid = sid;
-
-      // we do not dereference the key, do not extract the string value, so it it
-      // ok to just move it. We can not dereference it due to limitations of SmallString
-      // that rely on thread-local data-structure for pointer translation.
-      shard_result.key = it_pos.first.AsRef();
-    }
-  }
-
-  if (shard_result.sid == kInvalidSid) {
-    return OpStatus::KEY_NOTFOUND;
-  }
-
-  return OpResult<ShardFFResult>{move(shard_result)};
-}
-
-class BPopper {
- public:
-  explicit BPopper(ListDir dir);
-
-  // Returns WRONG_TYPE, OK.
-  // If OK is returned then use result() to fetch the value.
-  OpStatus Run(Transaction* t, unsigned msec);
-
-  // returns (key, value) pair.
-  auto result() const {
-    return make_pair<string_view, string_view>(key_, value_);
-  }
-
- private:
-  void Pop(Transaction* t, EngineShard* shard);
-  void OpPop(Transaction* t, EngineShard* shard);
-
-  ListDir dir_;
-
-  ShardFFResult ff_result_;
-
-  string key_;
-  string value_;
-};
+// Temporary debug measures. Trace what happens with list keys on given shard.
+// Used to recover logs for BLPOP failures. See OpBPop.
+thread_local CircularMessages debugMessages{100};
 
 class BPopPusher {
  public:
@@ -231,7 +163,7 @@ class BPopPusher {
 
   // Returns WRONG_TYPE, OK.
   // If OK is returned then use result() to fetch the value.
-  OpResult<string> Run(Transaction* t, unsigned msec);
+  OpResult<string> Run(Transaction* t, unsigned limit_ms);
 
  private:
   OpResult<string> RunSingle(Transaction* t, time_point tp);
@@ -241,90 +173,52 @@ class BPopPusher {
   ListDir popdir_, pushdir_;
 };
 
-BPopper::BPopper(ListDir dir) : dir_(dir) {
-}
+// Called as a callback from MKBlocking after we've determined which key to pop.
+std::string OpBPop(Transaction* t, EngineShard* shard, std::string_view key, ListDir dir) {
+  DVLOG(2) << "popping from " << key << " " << t->DebugId();
 
-OpStatus BPopper::Run(Transaction* trans, unsigned msec) {
-  auto tp = msec ? chrono::steady_clock::now() + chrono::milliseconds(msec) : time_point::max();
-  bool is_multi = trans->IsMulti();
-
-  trans->Schedule();
-
-  auto* stats = ServerState::tl_connection_stats();
-
-  OpResult<ShardFFResult> result = FindFirst(trans);
-
-  if (result.ok()) {
-    ff_result_ = move(result.value());
-  } else if (result.status() == OpStatus::KEY_NOTFOUND) {
-    // Close transaction and return.
-    if (is_multi) {
-      auto cb = [](Transaction* t, EngineShard* shard) { return OpStatus::OK; };
-      trans->Execute(std::move(cb), true);
-      return OpStatus::TIMED_OUT;
-    }
-
-    auto wcb = [](Transaction* t, EngineShard* shard) {
-      return t->GetShardArgs(shard->shard_id());
-    };
-
-    VLOG(1) << "Blocking BLPOP " << trans->DebugId();
-    ++stats->num_blocked_clients;
-    bool wait_succeeded = trans->WaitOnWatch(tp, std::move(wcb));
-    --stats->num_blocked_clients;
-
-    if (!wait_succeeded)
-      return OpStatus::TIMED_OUT;
-  } else {
-    // Could be the wrong-type error.
-    // cleanups, locks removal etc.
-    auto cb = [](Transaction* t, EngineShard* shard) { return OpStatus::OK; };
-    trans->Execute(std::move(cb), true);
-
-    DCHECK_NE(result.status(), OpStatus::KEY_NOTFOUND);
-    return result.status();
-  }
-
-  auto cb = [this](Transaction* t, EngineShard* shard) {
-    Pop(t, shard);
-    return OpStatus::OK;
-  };
-  trans->Execute(std::move(cb), true);
-
-  return OpStatus::OK;
-}
-
-void BPopper::Pop(Transaction* t, EngineShard* shard) {
-  if (auto wake_key = t->GetWakeKey(shard->shard_id()); wake_key) {
-    key_ = *wake_key;
-    OpPop(t, shard);
-  } else if (shard->shard_id() == ff_result_.sid) {
-    ff_result_.key.GetString(&key_);
-    OpPop(t, shard);
-  }
-}
-
-void BPopper::OpPop(Transaction* t, EngineShard* shard) {
   auto& db_slice = shard->db_slice();
-  auto it_res = db_slice.Find(t->GetDbContext(), key_, OBJ_LIST);
-  CHECK(it_res) << t->DebugId() << " " << key_;  // must exist and must be ok.
-  PrimeIterator it = *it_res;
+  auto it_res = db_slice.Find(t->GetDbContext(), key, OBJ_LIST);
 
+  if (!it_res) {
+    auto messages = debugMessages.All();
+    stringstream out;
+    out << "CRASH REPORT" << endl;
+    out << "key: " << key << " tx: " << t->DebugId() << "\n";
+    out << "===\n";
+    for (auto msg : messages)
+      out << msg << "\n";
+    out << "===" << endl;
+    LOG(ERROR) << out.str();
+    LOG(FATAL)
+        << "Encountered critical error. Please open a github issue or message us on discord with "
+           "attached report. https://github.com/dragonflydb/dragonfly";
+  }
+
+  CHECK(it_res) << t->DebugId() << " " << key;  // must exist and must be ok.
+
+  PrimeIterator it = *it_res;
   quicklist* ql = GetQL(it->second);
 
-  DVLOG(2) << "popping from " << key_ << " " << t->DebugId();
+  absl::StrAppend(debugMessages.Next(), "OpBPop", key, " by ", t->DebugId());
+
   db_slice.PreUpdate(t->GetDbIndex(), it);
-  value_ = ListPop(dir_, ql);
-  db_slice.PostUpdate(t->GetDbIndex(), it, key_);
+  std::string value = ListPop(dir, ql);
+  db_slice.PostUpdate(t->GetDbIndex(), it, key);
+
   if (quicklistCount(ql) == 0) {
-    DVLOG(1) << "deleting key " << key_ << " " << t->DebugId();
+    DVLOG(1) << "deleting key " << key << " " << t->DebugId();
+    absl::StrAppend(debugMessages.Next(), "OpBPop Del: ", key, " by ", t->DebugId());
+
     CHECK(shard->db_slice().Del(t->GetDbIndex(), it));
   }
-  OpArgs op_args = t->GetOpArgs(shard);
-  if (op_args.shard->journal()) {
-    string command = dir_ == ListDir::LEFT ? "LPOP" : "RPOP";
-    RecordJournal(op_args, command, ArgSlice{key_}, 1);
+
+  if (OpArgs op_args = t->GetOpArgs(shard); op_args.shard->journal()) {
+    string command = dir == ListDir::LEFT ? "LPOP" : "RPOP";
+    RecordJournal(op_args, command, ArgSlice{key}, 1);
   }
+
+  return value;
 }
 
 OpResult<string> OpMoveSingleShard(const OpArgs& op_args, string_view src, string_view dest,
@@ -461,11 +355,15 @@ OpResult<uint32_t> OpPush(const OpArgs& op_args, std::string_view key, ListDir d
     if (es->blocking_controller()) {
       string tmp;
       string_view key = it->first.GetSlice(&tmp);
+
+      absl::StrAppend(debugMessages.Next(), "OpPush AwakeWatched: ", string{key}, " by ",
+                      op_args.tx->DebugId(), " expire: ", it->second.HasExpire());
       es->blocking_controller()->AwakeWatched(op_args.db_cntx.db_index, key);
     }
   } else {
     es->db_slice().PostUpdate(op_args.db_cntx.db_index, it, key, true);
   }
+
   if (journal_rewrite && op_args.shard->journal()) {
     string command = dir == ListDir::LEFT ? "LPUSH" : "RPUSH";
     vector<string_view> mapped(vals.size() + 1);
@@ -507,8 +405,10 @@ OpResult<StringVec> OpPop(const OpArgs& op_args, string_view key, ListDir dir, u
   db_slice.PostUpdate(op_args.db_cntx.db_index, it, key);
 
   if (quicklistCount(ql) == 0) {
+    absl::StrAppend(debugMessages.Next(), "OpPop Del: ", key, " by ", op_args.tx->DebugId());
     CHECK(db_slice.Del(op_args.db_cntx.db_index, it));
   }
+
   if (op_args.shard->journal() && journal_rewrite) {
     string command = dir == ListDir::LEFT ? "LPOP" : "RPOP";
     RecordJournal(op_args, command, ArgSlice{key}, 2);
@@ -693,7 +593,6 @@ OpResult<int> OpInsert(const OpArgs& op_args, string_view key, string_view pivot
 }
 
 OpResult<uint32_t> OpRem(const OpArgs& op_args, string_view key, string_view elem, long count) {
-  DCHECK(!elem.empty());
   auto& db_slice = op_args.shard->db_slice();
   auto it_res = db_slice.Find(op_args.db_cntx, key, OBJ_LIST);
   if (!it_res)
@@ -736,7 +635,6 @@ OpResult<uint32_t> OpRem(const OpArgs& op_args, string_view key, string_view ele
 }
 
 OpStatus OpSet(const OpArgs& op_args, string_view key, string_view elem, long index) {
-  DCHECK(!elem.empty());
   auto& db_slice = op_args.shard->db_slice();
   auto it_res = db_slice.Find(op_args.db_cntx, key, OBJ_LIST);
   if (!it_res)
@@ -794,6 +692,7 @@ OpStatus OpTrim(const OpArgs& op_args, string_view key, long start, long end) {
   db_slice.PostUpdate(op_args.db_cntx.db_index, it, key);
 
   if (quicklistCount(ql) == 0) {
+    absl::StrAppend(debugMessages.Next(), "OpTrim Del: ", key, " by ", op_args.tx->DebugId());
     CHECK(db_slice.Del(op_args.db_cntx.db_index, it));
   }
   return OpStatus::OK;
@@ -951,9 +850,9 @@ BPopPusher::BPopPusher(string_view pop_key, string_view push_key, ListDir popdir
     : pop_key_(pop_key), push_key_(push_key), popdir_(popdir), pushdir_(pushdir) {
 }
 
-OpResult<string> BPopPusher::Run(Transaction* t, unsigned msec) {
+OpResult<string> BPopPusher::Run(Transaction* t, unsigned limit_ms) {
   time_point tp =
-      msec ? chrono::steady_clock::now() + chrono::milliseconds(msec) : time_point::max();
+      limit_ms ? chrono::steady_clock::now() + chrono::milliseconds(limit_ms) : time_point::max();
 
   t->Schedule();
 
@@ -987,15 +886,10 @@ OpResult<string> BPopPusher::RunSingle(Transaction* t, time_point tp) {
     return op_res;
   }
 
-  auto* stats = ServerState::tl_connection_stats();
-
   auto wcb = [&](Transaction* t, EngineShard* shard) { return ArgSlice{&this->pop_key_, 1}; };
 
   // Block
-  ++stats->num_blocked_clients;
   bool wait_succeeded = t->WaitOnWatch(tp, std::move(wcb));
-  --stats->num_blocked_clients;
-
   if (!wait_succeeded)
     return OpStatus::TIMED_OUT;
 
@@ -1014,19 +908,13 @@ OpResult<string> BPopPusher::RunPair(Transaction* t, time_point tp) {
     return op_res;
   }
 
-  auto* stats = ServerState::tl_connection_stats();
-
   // a hack: we watch in both shards for pop_key but only in the source shard it's relevant.
   // Therefore we follow the regular flow of watching the key but for the destination shard it
   // will never be triggerred.
   // This allows us to run Transaction::Execute on watched transactions in both shards.
   auto wcb = [&](Transaction* t, EngineShard* shard) { return ArgSlice{&this->pop_key_, 1}; };
 
-  ++stats->num_blocked_clients;
-
   bool wait_succeeded = t->WaitOnWatch(tp, std::move(wcb));
-  --stats->num_blocked_clients;
-
   if (!wait_succeeded)
     return OpStatus::TIMED_OUT;
 
@@ -1122,6 +1010,7 @@ void ListFamily::LPos(CmdArgList args, ConnectionContext* cntx) {
       (*cntx)->SendLong((*result)[0]);
     }
   } else {
+    SinkReplyBuilder::ReplyAggregator agg(cntx->reply_builder());
     (*cntx)->StartArray(result->size());
     const auto& array = result.value();
     for (const auto& v : array) {
@@ -1161,7 +1050,7 @@ void ListFamily::LInsert(CmdArgList args, ConnectionContext* cntx) {
   string_view elem = ArgS(args, 3);
   int where;
 
-  ToUpper(&args[2]);
+  ToUpper(&args[1]);
   if (param == "AFTER") {
     where = LIST_TAIL;
   } else if (param == "BEFORE") {
@@ -1308,16 +1197,20 @@ void ListFamily::BPopGeneric(ListDir dir, CmdArgList args, ConnectionContext* cn
   VLOG(1) << "BPop timeout(" << timeout << ")";
 
   Transaction* transaction = cntx->transaction;
-  BPopper popper(dir);
-  OpStatus result = popper.Run(transaction, unsigned(timeout * 1000));
+
+  absl::StrAppend(debugMessages.Next(), "BPopGeneric by ", transaction->DebugId());
+
+  std::string popped_key, popped_value;
+  auto cb = [dir, &popped_value](Transaction* t, EngineShard* shard, std::string_view key) {
+    popped_value = OpBPop(t, shard, key, dir);
+  };
+
+  OpStatus result = container_utils::RunCbOnFirstNonEmptyBlocking(
+      cb, &popped_key, transaction, OBJ_LIST, unsigned(timeout * 1000));
 
   if (result == OpStatus::OK) {
-    auto res = popper.result();
-
-    DVLOG(1) << "BPop " << transaction->DebugId() << " popped from key " << res.first;  // key.
-
-    std::string_view str_arr[2] = {res.first, res.second};
-
+    DVLOG(1) << "BPop " << transaction->DebugId() << " popped from key " << popped_key;  // key.
+    std::string_view str_arr[2] = {popped_key, popped_value};
     return (*cntx)->SendStringArr(str_arr);
   }
 

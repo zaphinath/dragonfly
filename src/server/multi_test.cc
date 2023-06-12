@@ -17,7 +17,7 @@
 
 ABSL_DECLARE_FLAG(uint32_t, multi_exec_mode);
 ABSL_DECLARE_FLAG(bool, multi_exec_squash);
-ABSL_DECLARE_FLAG(std::string, default_lua_config);
+ABSL_DECLARE_FLAG(std::string, default_lua_flags);
 
 namespace dfly {
 
@@ -40,7 +40,6 @@ const char kKey4[] = "y";
 const char kKeySid0[] = "x";
 const char kKeySid1[] = "c";
 const char kKeySid2[] = "b";
-const char kKey2Sid0[] = "y";
 
 }  // namespace
 
@@ -200,6 +199,8 @@ TEST_F(MultiTest, MultiConsistent) {
   if (multi_mode == Transaction::NON_ATOMIC)
     return;
 
+  Run({"mset", kKey1, "base", kKey4, "base"});
+
   auto mset_fb = pp_->at(0)->LaunchFiber([&] {
     for (size_t i = 1; i < 10; ++i) {
       string base = StrCat(i * 900);
@@ -337,8 +338,8 @@ TEST_F(MultiTest, FlushDb) {
 }
 
 TEST_F(MultiTest, Eval) {
-  if (auto config = absl::GetFlag(FLAGS_default_lua_config); config != "") {
-    LOG(WARNING) << "Skipped Eval test because default_lua_config is set";
+  if (auto config = absl::GetFlag(FLAGS_default_lua_flags); config != "") {
+    LOG(WARNING) << "Skipped Eval test because default_lua_flags is set";
     return;
   }
 
@@ -519,8 +520,8 @@ TEST_F(MultiTest, MultiOOO) {
 
 // Lua scripts lock their keys ahead and thus can run out of order.
 TEST_F(MultiTest, EvalOOO) {
-  if (auto config = absl::GetFlag(FLAGS_default_lua_config); config != "") {
-    LOG(WARNING) << "Skipped Eval test because default_lua_config is set";
+  if (auto config = absl::GetFlag(FLAGS_default_lua_flags); config != "") {
+    LOG(WARNING) << "Skipped Eval test because default_lua_flags is set";
     return;
   }
 
@@ -556,9 +557,9 @@ TEST_F(MultiTest, EvalOOO) {
 //        MULTI - SET k1 v - SET k2 v - SET k3 v - EXEC
 // but the order of the commands inside appears in any permutation.
 TEST_F(MultiTest, MultiContendedPermutatedKeys) {
-  const int kRounds = 5;
+  constexpr int kRounds = 5;
 
-  auto run = [this, kRounds](vector<string> keys, bool reversed) {
+  auto run = [this](vector<string> keys, bool reversed) {
     int i = 0;
     do {
       Run({"multi"});
@@ -630,9 +631,9 @@ TEST_F(MultiTest, ExecGlobalFallback) {
   //  EXPECT_EQ(1, GetMetrics().ooo_tx_transaction_cnt);
 }
 
-TEST_F(MultiTest, ScriptConfig) {
-  if (auto config = absl::GetFlag(FLAGS_default_lua_config); config != "") {
-    LOG(WARNING) << "Skipped Eval test because default_lua_config is set";
+TEST_F(MultiTest, ScriptFlagsCommand) {
+  if (auto flags = absl::GetFlag(FLAGS_default_lua_flags); flags != "") {
+    LOG(WARNING) << "Skipped Eval test because default_lua_flags is set";
     return;
   }
 
@@ -642,30 +643,31 @@ TEST_F(MultiTest, ScriptConfig) {
   Run({"set", "random-key-1", "works"});
   Run({"set", "random-key-2", "works"});
 
-  // Check SCRIPT CONFIG is applied correctly to loaded scripts.
+  // Check SCRIPT FLAGS is applied correctly to loaded scripts.
   {
     auto sha_resp = Run({"script", "load", kUndeclared1});
     auto sha = facade::ToSV(sha_resp.GetBuf());
 
     EXPECT_THAT(Run({"evalsha", sha, "0"}), ErrArg("undeclared"));
 
-    EXPECT_THAT(Run({"script", "config", sha, "allow-undeclared-keys"}), "OK");
+    EXPECT_EQ(Run({"script", "flags", sha, "allow-undeclared-keys"}), "OK");
+
     EXPECT_THAT(Run({"evalsha", sha, "0"}), "works");
   }
 
-  // Check SCRIPT CONFIG can be applied by sha before loading.
+  // Check SCRIPT FLAGS can be applied by sha before loading.
   {
     char sha_buf[41];
     Interpreter::FuncSha1(kUndeclared2, sha_buf);
     string_view sha{sha_buf, 40};
 
-    EXPECT_THAT(Run({"script", "config", sha, "allow-undeclared-keys"}), "OK");
+    EXPECT_THAT(Run({"script", "flags", sha, "allow-undeclared-keys"}), "OK");
 
     EXPECT_THAT(Run({"eval", kUndeclared2, "0"}), "works");
   }
 }
 
-TEST_F(MultiTest, ScriptFlags) {
+TEST_F(MultiTest, ScriptFlagsEmbedded) {
   const char* s1 = R"(
   #!lua flags=allow-undeclared-keys
   return redis.call('GET', 'random-key');
@@ -689,10 +691,10 @@ TEST_F(MultiTest, ContendedList) {
   if (absl::GetFlag(FLAGS_multi_exec_mode) == Transaction::NON_ATOMIC)
     return;
 
-  const int listSize = 50;
-  const int stepSize = 5;
+  constexpr int listSize = 50;
+  constexpr int stepSize = 5;
 
-  auto run = [this, listSize, stepSize](string_view src, string_view dest) {
+  auto run = [this](string_view src, string_view dest) {
     for (int i = 0; i < listSize / stepSize; i++) {
       Run({"multi"});
       Run({"sort", src});

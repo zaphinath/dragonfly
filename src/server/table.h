@@ -39,6 +39,8 @@ inline bool IsValid(ExpireIterator it) {
 
 struct SlotStats {
   uint64_t key_count = 0;
+  uint64_t total_reads = 0;
+  uint64_t total_writes = 0;
   SlotStats& operator+=(const SlotStats& o);
 };
 
@@ -82,7 +84,7 @@ struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_coun
 
   TopKeys top_keys;
 
-  explicit DbTable(std::pmr::memory_resource* mr);
+  explicit DbTable(PMR_NS::memory_resource* mr);
   ~DbTable();
 
   void Clear();

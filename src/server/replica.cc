@@ -26,6 +26,7 @@ extern "C" {
 #include "server/rdb_load.h"
 #include "strings/human_readable.h"
 
+ABSL_FLAG(int, replication_acks_interval, 3000, "Interval between acks in milliseconds.");
 ABSL_FLAG(bool, enable_multi_shard_sync, false,
           "Execute multi shards commands on replica syncrhonized");
 ABSL_FLAG(std::string, masterauth, "", "password for authentication with master");
@@ -34,6 +35,14 @@ ABSL_FLAG(int, master_connect_timeout_ms, 20000,
 ABSL_FLAG(int, master_reconnect_timeout_ms, 1000,
           "Timeout for re-establishing connection to a replication master");
 ABSL_DECLARE_FLAG(uint32_t, port);
+
+#define RETURN_ON_BAD_RESPONSE(x)                                                               \
+  do {                                                                                          \
+    if (!(x)) {                                                                                 \
+      LOG(ERROR) << "Bad response to \"" << last_cmd_ << "\": \"" << absl::CEscape(last_resp_); \
+      return std::make_error_code(errc::bad_message);                                           \
+    }                                                                                           \
+  } while (false)
 
 namespace dfly {
 
@@ -138,6 +147,9 @@ Replica::~Replica() {
   if (sync_fb_.IsJoinable()) {
     sync_fb_.Join();
   }
+  if (acks_fb_.IsJoinable()) {
+    acks_fb_.Join();
+  }
   if (execution_fb_.IsJoinable()) {
     execution_fb_.Join();
   }
@@ -202,8 +214,11 @@ void Replica::Stop() {
 
   // Make sure the replica fully stopped and did all cleanup,
   // so we can freely release resources (connections).
+  waker_.notifyAll();
   if (sync_fb_.IsJoinable())
     sync_fb_.Join();
+  if (acks_fb_.IsJoinable())
+    acks_fb_.Join();
 }
 
 void Replica::Pause(bool pause) {
@@ -348,113 +363,97 @@ error_code Replica::ConnectAndAuth(std::chrono::milliseconds connect_timeout_ms)
   auto masterauth = absl::GetFlag(FLAGS_masterauth);
   if (!masterauth.empty()) {
     ReqSerializer serializer{sock_.get()};
-    uint32_t consumed = 0;
-    base::IoBuf io_buf{128};
     parser_.reset(new RedisParser{false});
-    RETURN_ON_ERR(SendCommand(StrCat("AUTH ", masterauth), &serializer));
-    RETURN_ON_ERR(ReadRespReply(&io_buf, &consumed));
-    if (!CheckRespIsSimpleReply("OK")) {
-      LOG(ERROR) << "Failed authentication with masters " << ToSV(io_buf.InputBuffer());
-      return make_error_code(errc::bad_message);
-    }
+    RETURN_ON_ERR(SendCommandAndReadResponse(StrCat("AUTH ", masterauth), &serializer));
+    RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
   }
   return error_code{};
 }
 
 error_code Replica::Greet() {
   parser_.reset(new RedisParser{false});
-  base::IoBuf io_buf{128};
   ReqSerializer serializer{sock_.get()};
-  uint32_t consumed = 0;
   VLOG(1) << "greeting message handling";
   // Corresponds to server.repl_state == REPL_STATE_CONNECTING state in redis
-  RETURN_ON_ERR(SendCommand("PING", &serializer));  // optional.
-  RETURN_ON_ERR(ReadRespReply(&io_buf, &consumed));
-  if (!CheckRespIsSimpleReply("PONG")) {
-    LOG(ERROR) << "Bad pong response " << ToSV(io_buf.InputBuffer());
-    return make_error_code(errc::bad_message);
-  }
-
-  io_buf.ConsumeInput(consumed);
+  RETURN_ON_ERR(SendCommandAndReadResponse("PING", &serializer));  // optional.
+  RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("PONG"));
 
   // Corresponds to server.repl_state == REPL_STATE_SEND_HANDSHAKE condition in replication.c
   auto port = absl::GetFlag(FLAGS_port);
-  RETURN_ON_ERR(SendCommand(StrCat("REPLCONF listening-port ", port), &serializer));
-  RETURN_ON_ERR(ReadRespReply(&io_buf, &consumed));
-  if (!CheckRespIsSimpleReply("OK")) {
-    LOG(ERROR) << "Bad REPLCONF response " << ToSV(io_buf.InputBuffer());
-    return make_error_code(errc::bad_message);
-  }
-
-  io_buf.ConsumeInput(consumed);
+  RETURN_ON_ERR(SendCommandAndReadResponse(StrCat("REPLCONF listening-port ", port), &serializer));
+  RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
 
   // Corresponds to server.repl_state == REPL_STATE_SEND_CAPA
-  RETURN_ON_ERR(SendCommand("REPLCONF capa eof capa psync2", &serializer));
-  RETURN_ON_ERR(ReadRespReply(&io_buf, &consumed));
-  if (!CheckRespIsSimpleReply("OK")) {
-    LOG(ERROR) << "Bad REPLCONF response " << ToSV(io_buf.InputBuffer());
-    return make_error_code(errc::bad_message);
-  }
-
-  io_buf.ConsumeInput(consumed);
+  RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF capa eof capa psync2", &serializer));
+  RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
 
   // Announce that we are the dragonfly client.
   // Note that we currently do not support dragonfly->redis replication.
-  RETURN_ON_ERR(SendCommand("REPLCONF capa dragonfly", &serializer));
-  RETURN_ON_ERR(ReadRespReply(&io_buf, &consumed));
-  if (!CheckRespFirstTypes({RespExpr::STRING})) {
-    return make_error_code(errc::bad_message);
-  }
+  RETURN_ON_ERR(SendCommandAndReadResponse("REPLCONF capa dragonfly", &serializer));
+  RETURN_ON_BAD_RESPONSE(CheckRespFirstTypes({RespExpr::STRING}));
 
-  string_view cmd = ToSV(resp_args_[0].GetBuf());
   if (resp_args_.size() == 1) {  // Redis
-    if (cmd != "OK") {
-      LOG(ERROR) << "Unexpected response " << cmd;
-      return make_error_code(errc::bad_message);
-    }
-  } else if (resp_args_.size() == 3) {  // it's dragonfly master.
-    // Response is: <master_repl_id, syncid, num_shards>
-    if (!CheckRespFirstTypes({RespExpr::STRING, RespExpr::STRING, RespExpr::INT64}) ||
-        resp_args_[0].GetBuf().size() != CONFIG_RUN_ID_SIZE) {
-      LOG(ERROR) << "Unexpected response " << ToSV(io_buf.InputBuffer());
-      return make_error_code(errc::bad_message);
-    }
-
-    string_view param0 = ToSV(resp_args_[0].GetBuf());
-    string_view param1 = ToSV(resp_args_[1].GetBuf());
-    int64 param2 = get<int64_t>(resp_args_[2].u);
-
-    if (param2 <= 0 || param2 > 1024) {
-      // sanity check, we support upto 1024 shards.
-      // It's not that we can not support more but it's probably highly unlikely that someone
-      // will run dragonfly with more than 1024 cores.
-      LOG(ERROR) << "Invalid flow count " << param2;
-      return make_error_code(errc::bad_message);
-    }
-
-    master_context_.master_repl_id = param0;
-    master_context_.dfly_session_id = param1;
-    num_df_flows_ = param2;
-    io_buf.ConsumeInput(consumed);
-    // We need to send this because we may require to use this for cluster commands.
-    // this reason to send this here is that in other context we can get an error reply
-    // since we are budy with the replication
-    RETURN_ON_ERR(SendCommand(StrCat("REPLCONF CLIENT-ID ", id_), &serializer));
-    RETURN_ON_ERR(ReadRespReply(&io_buf, &consumed));
-    if (!CheckRespIsSimpleReply("OK")) {
-      LOG(WARNING) << "master did not return OK on id message";
-    }
-    VLOG(1) << "Master id: " << master_context_.master_repl_id
-            << ", sync id: " << master_context_.dfly_session_id << ", num journals "
-            << num_df_flows_;
+    RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
+  } else if (resp_args_.size() >= 3) {  // it's dragonfly master.
+    RETURN_ON_BAD_RESPONSE(!HandleCapaDflyResp());
+    if (auto ec = ConfigureDflyMaster(); ec)
+      return ec;
   } else {
-    LOG(ERROR) << "Bad response " << ToSV(io_buf.InputBuffer());
+    RETURN_ON_BAD_RESPONSE(false);
+  }
 
+  state_mask_.fetch_or(R_GREETED);
+  return error_code{};
+}
+
+std::error_code Replica::HandleCapaDflyResp() {
+  // Response is: <master_repl_id, syncid, num_shards [, version]>
+  if (!CheckRespFirstTypes({RespExpr::STRING, RespExpr::STRING, RespExpr::INT64}) ||
+      resp_args_[0].GetBuf().size() != CONFIG_RUN_ID_SIZE)
+    return make_error_code(errc::bad_message);
+
+  int64 param_num_flows = get<int64_t>(resp_args_[2].u);
+  if (param_num_flows <= 0 || param_num_flows > 1024) {
+    // sanity check, we support upto 1024 shards.
+    // It's not that we can not support more but it's probably highly unlikely that someone
+    // will run dragonfly with more than 1024 cores.
+    LOG(ERROR) << "Invalid flow count " << param_num_flows;
     return make_error_code(errc::bad_message);
   }
 
-  io_buf.ConsumeInput(consumed);
-  state_mask_.fetch_or(R_GREETED);
+  master_context_.master_repl_id = ToSV(resp_args_[0].GetBuf());
+  master_context_.dfly_session_id = ToSV(resp_args_[1].GetBuf());
+  num_df_flows_ = param_num_flows;
+
+  if (resp_args_.size() >= 4) {
+    RETURN_ON_BAD_RESPONSE(resp_args_[3].type == RespExpr::INT64);
+    master_context_.version = DflyVersion(get<int64_t>(resp_args_[3].u));
+  }
+  VLOG(1) << "Master id: " << master_context_.master_repl_id
+          << ", sync id: " << master_context_.dfly_session_id << ", num journals: " << num_df_flows_
+          << ", version: " << unsigned(master_context_.version);
+
+  return error_code{};
+}
+
+std::error_code Replica::ConfigureDflyMaster() {
+  ReqSerializer serializer{sock_.get()};
+
+  // We need to send this because we may require to use this for cluster commands.
+  // this reason to send this here is that in other context we can get an error reply
+  // since we are budy with the replication
+  RETURN_ON_ERR(SendCommandAndReadResponse(StrCat("REPLCONF CLIENT-ID ", id_), &serializer));
+  if (!CheckRespIsSimpleReply("OK")) {
+    LOG(WARNING) << "Bad REPLCONF CLIENT-ID response";
+  }
+
+  // Tell the master our version if it supports REPLCONF CLIENT-VERSION
+  if (master_context_.version > DflyVersion::VER0) {
+    RETURN_ON_ERR(SendCommandAndReadResponse(
+        StrCat("REPLCONF CLIENT-VERSION ", DflyVersion::CURRENT_VER), &serializer));
+    RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
+  }
+
   return error_code{};
 }
 
@@ -698,9 +697,9 @@ error_code Replica::ConsumeDflyStream() {
       flow->waker_.notifyAll();
     }
 
-    // Iterate over map and cancle all blocking entities
+    // Iterate over map and cancel all blocking entities
     {
-      lock_guard l{multi_shard_exe_->map_mu};
+      lock_guard lk{multi_shard_exe_->map_mu};
       for (auto& tx_data : multi_shard_exe_->tx_sync_execution) {
         tx_data.second.barrier.Cancel();
         tx_data.second.block.Cancel();
@@ -752,6 +751,9 @@ void Replica::JoinAllFlows() {
     if (flow->sync_fb_.IsJoinable()) {
       flow->sync_fb_.Join();
     }
+    if (flow->acks_fb_.IsJoinable()) {
+      flow->acks_fb_.Join();
+    }
     if (flow->execution_fb_.IsJoinable()) {
       flow->execution_fb_.Join();
     }
@@ -774,15 +776,9 @@ error_code Replica::SendNextPhaseRequest(bool stable) {
   string request = StrCat("DFLY ", kind, " ", master_context_.dfly_session_id);
 
   VLOG(1) << "Sending: " << request;
-  RETURN_ON_ERR(SendCommand(request, &serializer));
+  RETURN_ON_ERR(SendCommandAndReadResponse(request, &serializer));
 
-  base::IoBuf io_buf{128};
-  unsigned consumed = 0;
-  RETURN_ON_ERR(ReadRespReply(&io_buf, &consumed));
-  if (!CheckRespIsSimpleReply("OK")) {
-    LOG(ERROR) << "Phase transition failed " << ToSV(io_buf.InputBuffer());
-    return make_error_code(errc::bad_message);
-  }
+  RETURN_ON_BAD_RESPONSE(CheckRespIsSimpleReply("OK"));
 
   return std::error_code{};
 }
@@ -798,28 +794,17 @@ error_code Replica::StartFullSyncFlow(BlockingCounter sb, Context* cntx) {
   ReqSerializer serializer{sock_.get()};
   auto cmd = StrCat("DFLY FLOW ", master_context_.master_repl_id, " ",
                     master_context_.dfly_session_id, " ", master_context_.dfly_flow_id);
-  RETURN_ON_ERR(SendCommand(cmd, &serializer));
 
   parser_.reset(new RedisParser{false});  // client mode
-
   leftover_buf_.emplace(128);
-  unsigned consumed = 0;
-  RETURN_ON_ERR(ReadRespReply(&*leftover_buf_, &consumed));  // uses parser_
+  RETURN_ON_ERR(SendCommandAndReadResponse(cmd, &serializer, &*leftover_buf_));
 
-  if (!CheckRespFirstTypes({RespExpr::STRING, RespExpr::STRING})) {
-    LOG(ERROR) << "Bad FLOW response " << ToSV(leftover_buf_->InputBuffer());
-    return make_error_code(errc::bad_message);
-  }
+  RETURN_ON_BAD_RESPONSE(CheckRespFirstTypes({RespExpr::STRING, RespExpr::STRING}));
 
   string_view flow_directive = ToSV(resp_args_[0].GetBuf());
   string eof_token;
-  if (flow_directive == "FULL") {
-    eof_token = ToSV(resp_args_[1].GetBuf());
-  } else {
-    LOG(ERROR) << "Bad FLOW response " << ToSV(leftover_buf_->InputBuffer());
-    return make_error_code(errc::bad_message);
-  }
-  leftover_buf_->ConsumeInput(consumed);
+  RETURN_ON_BAD_RESPONSE(flow_directive == "FULL");
+  eof_token = ToSV(resp_args_[1].GetBuf());
 
   state_mask_.fetch_or(R_TCP_CONNECTED);
 
@@ -888,6 +873,7 @@ void Replica::FullSyncDflyFb(string eof_token, BlockingCounter bc, Context* cntx
     leftover_buf_.reset();
   }
 
+  this->journal_rec_executed_.store(loader.journal_offset());
   VLOG(1) << "FullSyncDflyFb finished after reading " << loader.bytes_read() << " bytes";
 }
 
@@ -902,6 +888,11 @@ void Replica::StableSyncDflyReadFb(Context* cntx) {
 
   JournalReader reader{&ps, 0};
   TransactionReader tx_reader{};
+
+  if (master_context_.version > DflyVersion::VER0) {
+    acks_fb_ = MakeFiber(&Replica::StableSyncDflyAcksFb, this, cntx);
+  }
+
   while (!cntx->IsCancelled()) {
     waker_.await([&]() {
       return ((trans_data_queue_.size() < kYieldAfterItemsInQueue) || cntx->IsCancelled());
@@ -915,13 +906,51 @@ void Replica::StableSyncDflyReadFb(Context* cntx) {
 
     last_io_time_ = sock_->proactor()->GetMonotonicTimeNs();
 
-    if (use_multi_shard_exe_sync_) {
-      InsertTxDataToShardResource(std::move(*tx_data));
+    if (!tx_data->is_ping) {
+      if (use_multi_shard_exe_sync_) {
+        InsertTxDataToShardResource(std::move(*tx_data));
+      } else {
+        ExecuteTxWithNoShardSync(std::move(*tx_data), cntx);
+      }
     } else {
-      ExecuteTxWithNoShardSync(std::move(*tx_data), cntx);
+      force_ping_ = true;
+      journal_rec_executed_.fetch_add(1, std::memory_order_relaxed);
     }
 
     waker_.notify();
+  }
+}
+
+void Replica::StableSyncDflyAcksFb(Context* cntx) {
+  constexpr size_t kAckRecordMaxInterval = 1024;
+  std::chrono::duration ack_time_max_interval =
+      1ms * absl::GetFlag(FLAGS_replication_acks_interval);
+  std::string ack_cmd;
+  ReqSerializer serializer{sock_.get()};
+
+  auto next_ack_tp = std::chrono::steady_clock::now();
+
+  while (!cntx->IsCancelled()) {
+    // Handle ACKs with the master. PING opcodes from the master mean we should immediately
+    // answer.
+    uint64_t current_offset = journal_rec_executed_.load(std::memory_order_relaxed);
+    VLOG(1) << "Sending an ACK with offset=" << current_offset << " forced=" << force_ping_;
+    ack_cmd = absl::StrCat("REPLCONF ACK ", current_offset);
+    force_ping_ = false;
+    next_ack_tp = std::chrono::steady_clock::now() + ack_time_max_interval;
+    if (auto ec = SendCommand(ack_cmd, &serializer); ec) {
+      cntx->ReportError(ec);
+      break;
+    }
+    ack_offs_ = current_offset;
+
+    waker_.await_until(
+        [&]() {
+          return journal_rec_executed_.load(std::memory_order_relaxed) >
+                     ack_offs_ + kAckRecordMaxInterval ||
+                 force_ping_ || cntx->IsCancelled();
+        },
+        next_ack_tp);
   }
 }
 
@@ -980,7 +1009,7 @@ void Replica::ExecuteTx(TransactionData&& tx_data, bool inserted_by_me, Context*
   }
   if (tx_data.shard_cnt <= 1 || (!use_multi_shard_exe_sync_ && !tx_data.IsGlobalCmd())) {
     VLOG(2) << "Execute cmd without sync between shards. txid: " << tx_data.txid;
-    executor_->Execute(tx_data.dbid, tx_data.commands);
+    executor_->Execute(tx_data.dbid, absl::MakeSpan(tx_data.commands));
     journal_rec_executed_.fetch_add(tx_data.journal_rec_count, std::memory_order_relaxed);
     return;
   }
@@ -1012,7 +1041,7 @@ void Replica::ExecuteTx(TransactionData&& tx_data, bool inserted_by_me, Context*
     // Global command will be executed only from one flow fiber. This ensure corectness of data in
     // replica.
     if (inserted_by_me) {
-      executor_->Execute(tx_data.dbid, tx_data.commands);
+      executor_->Execute(tx_data.dbid, absl::MakeSpan(tx_data.commands));
     }
     // Wait until exection is done, to make sure we done execute next commands while the global is
     // executed.
@@ -1020,9 +1049,9 @@ void Replica::ExecuteTx(TransactionData&& tx_data, bool inserted_by_me, Context*
     // Check if we woke up due to cancellation.
     if (cntx_.IsCancelled())
       return;
-  } else {  // Non gloabl command will be executed by each the flow fiber
+  } else {  // Non global command will be executed by each flow fiber
     VLOG(2) << "Execute txid: " << tx_data.txid << " executing shard transaction commands";
-    executor_->Execute(tx_data.dbid, tx_data.commands);
+    executor_->Execute(tx_data.dbid, absl::MakeSpan(tx_data.commands));
   }
   journal_rec_executed_.fetch_add(tx_data.journal_rec_count, std::memory_order_relaxed);
 
@@ -1037,14 +1066,20 @@ void Replica::ExecuteTx(TransactionData&& tx_data, bool inserted_by_me, Context*
   }
 }
 
-error_code Replica::ReadRespReply(base::IoBuf* io_buf, uint32_t* consumed) {
+error_code Replica::ReadRespReply(base::IoBuf* buffer) {
   DCHECK(parser_);
 
   error_code ec;
+  if (!buffer) {
+    buffer = &resp_buf_;
+    buffer->Clear();
+  }
+  last_resp_ = "";
 
   // basically reflection of dragonfly_connection IoLoop function.
   while (!ec) {
-    io::MutableBytes buf = io_buf->AppendBuffer();
+    uint32_t consumed;
+    io::MutableBytes buf = buffer->AppendBuffer();
     io::Result<size_t> size_res = sock_->Recv(buf);
     if (!size_res)
       return size_res.error();
@@ -1053,20 +1088,20 @@ error_code Replica::ReadRespReply(base::IoBuf* io_buf, uint32_t* consumed) {
 
     last_io_time_ = sock_->proactor()->GetMonotonicTimeNs();
 
-    io_buf->CommitWrite(*size_res);
+    buffer->CommitWrite(*size_res);
 
-    RedisParser::Result result = parser_->Parse(io_buf->InputBuffer(), consumed, &resp_args_);
+    RedisParser::Result result = parser_->Parse(buffer->InputBuffer(), &consumed, &resp_args_);
+    last_resp_ += std::string_view((char*)buffer->InputBuffer().data(), consumed);
+    buffer->ConsumeInput(consumed);
 
     if (result == RedisParser::OK && !resp_args_.empty()) {
       return error_code{};  // success path
     }
 
     if (result != RedisParser::INPUT_PENDING) {
-      LOG(ERROR) << "Invalid parser status " << result << " for buffer of size "
-                 << io_buf->InputLen();
+      LOG(ERROR) << "Invalid parser status " << result << " for response " << last_resp_;
       return std::make_error_code(std::errc::bad_message);
     }
-    io_buf->ConsumeInput(*consumed);
   }
 
   return ec;
@@ -1278,10 +1313,21 @@ error_code Replica::SendCommand(string_view command, ReqSerializer* serializer) 
   return ec;
 }
 
+error_code Replica::SendCommandAndReadResponse(string_view command, ReqSerializer* serializer,
+                                               base::IoBuf* buffer) {
+  last_cmd_ = command;
+  if (auto ec = SendCommand(command, serializer); ec)
+    return ec;
+  return ReadRespReply(buffer);
+}
+
 bool Replica::TransactionData::AddEntry(journal::ParsedEntry&& entry) {
   ++journal_rec_count;
 
   switch (entry.opcode) {
+    case journal::Op::PING:
+      is_ping = true;
+      return true;
     case journal::Op::EXPIRED:
     case journal::Op::COMMAND:
       commands.push_back(std::move(entry.cmd));
@@ -1323,7 +1369,8 @@ auto Replica::TransactionReader::NextTxData(JournalReader* reader, Context* cntx
 
     // Check if journal command can be executed right away.
     // Expiration checks lock on master, so it never conflicts with running multi transactions.
-    if (res->opcode == journal::Op::EXPIRED || res->opcode == journal::Op::COMMAND)
+    if (res->opcode == journal::Op::EXPIRED || res->opcode == journal::Op::COMMAND ||
+        res->opcode == journal::Op::PING)
       return TransactionData::FromSingle(std::move(res.value()));
 
     // Otherwise, continue building multi command.

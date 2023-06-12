@@ -3,6 +3,8 @@
 //
 #pragma once
 
+#include <absl/container/inlined_vector.h>
+
 #include <boost/fiber/barrier.hpp>
 #include <queue>
 #include <variant>
@@ -12,6 +14,7 @@
 #include "facade/redis_parser.h"
 #include "server/common.h"
 #include "server/journal/types.h"
+#include "server/version.h"
 #include "util/fiber_socket_base.h"
 
 namespace facade {
@@ -36,6 +39,8 @@ class Replica {
     std::string master_repl_id;
     std::string dfly_session_id;         // Sync session id for dfly sync.
     uint32_t dfly_flow_id = UINT32_MAX;  // Flow id if replica acts as a dfly flow.
+
+    DflyVersion version = DflyVersion::VER0;
 
     std::string Description() const;
   };
@@ -65,8 +70,9 @@ class Replica {
     TxId txid{0};
     DbIndex dbid{0};
     uint32_t shard_cnt{0};
-    std::vector<journal::ParsedEntry::CmdData> commands{0};
+    absl::InlinedVector<journal::ParsedEntry::CmdData, 1> commands{0};
     uint32_t journal_rec_count{0};  // Count number of source entries to check offset.
+    bool is_ping = false;           // For Op::PING entries.
   };
 
   // Utility for reading TransactionData from a journal reader.
@@ -122,6 +128,9 @@ class Replica {
   std::error_code ConnectAndAuth(std::chrono::milliseconds connect_timeout_ms);
   std::error_code Greet();  // Send PING and REPLCONF.
 
+  std::error_code HandleCapaDflyResp();
+  std::error_code ConfigureDflyMaster();
+
   std::error_code InitiatePSync();     // Redis full sync.
   std::error_code InitiateDflySync();  // Dragonfly full sync.
 
@@ -154,6 +163,8 @@ class Replica {
   // Single flow stable state sync fiber spawned by StartStableSyncFlow.
   void StableSyncDflyReadFb(Context* cntx);
 
+  void StableSyncDflyAcksFb(Context* cntx);
+
   void StableSyncDflyExecFb(Context* cntx);
 
  private: /* Utility */
@@ -166,7 +177,9 @@ class Replica {
 
   // This function uses parser_ and cmd_args_ in order to consume a single response
   // from the sock_. The output will reside in cmd_str_args_.
-  std::error_code ReadRespReply(base::IoBuf* io_buf, uint32_t* consumed);
+  // For error reporting purposes, the parsed command would be in last_resp_.
+  // If io_buf is not given, a temporary buffer will be used.
+  std::error_code ReadRespReply(base::IoBuf* buffer = nullptr);
 
   std::error_code ParseReplicationHeader(base::IoBuf* io_buf, PSyncResponse* header);
   std::error_code ReadLine(base::IoBuf* io_buf, std::string_view* line);
@@ -181,6 +194,10 @@ class Replica {
 
   // Send command, update last_io_time, return error.
   std::error_code SendCommand(std::string_view command, facade::ReqSerializer* serializer);
+  // Send command, read response into resp_args_.
+  std::error_code SendCommandAndReadResponse(std::string_view command,
+                                             facade::ReqSerializer* serializer,
+                                             base::IoBuf* buffer = nullptr);
 
   void ExecuteTx(TransactionData&& tx_data, bool inserted_by_me, Context* cntx);
   void InsertTxDataToShardResource(TransactionData&& tx_data);
@@ -232,11 +249,20 @@ class Replica {
   bool use_multi_shard_exe_sync_;
 
   std::unique_ptr<JournalExecutor> executor_;
-  // Count the number of journal records executed in specific flow
+
+  // The master instance has a LSN for each journal record. This counts
+  // the number of journal records executed in this flow plus the initial
+  // journal offset that we received in the transition from full sync
+  // to stable sync.
+  // Note: This is not 1-to-1 the LSN in the master, because this counts
+  // **executed** records, which might be received interleaved when commands
+  // run out-of-order on the master instance.
   std::atomic_uint64_t journal_rec_executed_ = 0;
 
   // MainReplicationFb in standalone mode, FullSyncDflyFb in flow mode.
   Fiber sync_fb_;
+  Fiber acks_fb_;
+  bool force_ping_ = false;
   Fiber execution_fb_;
 
   std::vector<std::unique_ptr<Replica>> shard_flows_;
@@ -247,6 +273,9 @@ class Replica {
   std::optional<base::IoBuf> leftover_buf_;
   std::unique_ptr<facade::RedisParser> parser_;
   facade::RespVec resp_args_;
+  base::IoBuf resp_buf_;
+  std::string last_cmd_;
+  std::string last_resp_;
   facade::CmdArgVec cmd_str_args_;
 
   Context cntx_;  // context for tasks in replica.

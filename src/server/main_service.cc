@@ -23,6 +23,7 @@ extern "C" {
 #include "facade/error.h"
 #include "facade/reply_capture.h"
 #include "server/bitops_family.h"
+#include "server/cluster/cluster_family.h"
 #include "server/conn_context.h"
 #include "server/error.h"
 #include "server/generic_family.h"
@@ -32,7 +33,7 @@ extern "C" {
 #include "server/list_family.h"
 #include "server/multi_command_squasher.h"
 #include "server/script_mgr.h"
-#include "server/search_family.h"
+#include "server/search/search_family.h"
 #include "server/server_state.h"
 #include "server/set_family.h"
 #include "server/stream_family.h"
@@ -518,7 +519,8 @@ ExecEvalState DetermineEvalPresense(const std::vector<StoredCmd>& body) {
 
 }  // namespace
 
-Service::Service(ProactorPool* pp) : pp_(*pp), server_family_(this) {
+Service::Service(ProactorPool* pp)
+    : pp_(*pp), server_family_(this), cluster_family_(&server_family_) {
   CHECK(pp);
   CHECK(shard_set == NULL);
 
@@ -555,7 +557,7 @@ void Service::Init(util::AcceptServer* acceptor, util::ListenerInterface* main_i
   request_latency_usec.Init(&pp_);
   StringFamily::Init(&pp_);
   GenericFamily::Init(&pp_);
-  server_family_.Init(acceptor, main_interface);
+  server_family_.Init(acceptor, main_interface, &cluster_family_);
 
   ChannelStore* cs = new ChannelStore{};
   pp_.Await(
@@ -591,6 +593,11 @@ void Service::Shutdown() {
 
 bool Service::CheckKeysOwnership(const CommandId* cid, CmdArgList args,
                                  ConnectionContext* dfly_cntx) {
+  if (dfly_cntx->is_replicating) {
+    // Always allow commands on the replication port, as it might be for future-owned keys.
+    return true;
+  }
+
   if (cid->first_key_pos() == 0) {
     return true;  // No key command.
   }
@@ -614,13 +621,22 @@ bool Service::CheckKeysOwnership(const CommandId* cid, CmdArgList args,
       keys_slot = slot;
     }
   }
+
   if (cross_slot) {
     (*dfly_cntx)->SendError("-CROSSSLOT Keys in request don't hash to the same slot");
     return false;
   }
+
   // Check keys slot is in my ownership
-  if (keys_slot && !server_family_.cluster_config()->IsMySlot(*keys_slot)) {
-    (*dfly_cntx)->SendError("MOVED");  // TODO add more info to moved error.
+  const ClusterConfig* cluster_config = cluster_family_.cluster_config();
+  if (cluster_config == nullptr) {
+    (*dfly_cntx)->SendError(kClusterNotConfigured);
+    return false;
+  }
+  if (keys_slot.has_value() && !cluster_config->IsMySlot(*keys_slot)) {
+    // See more details here: https://redis.io/docs/reference/cluster-spec/#moved-redirection
+    ClusterConfig::Node master = cluster_config->GetMasterNodeForSlot(*keys_slot);
+    (*dfly_cntx)->SendError(absl::StrCat("-MOVED ", *keys_slot, " ", master.ip, ":", master.port));
     return false;
   }
 
@@ -707,8 +723,7 @@ bool Service::VerifyCommand(const CommandId* cid, CmdArgList args, ConnectionCon
     return false;
   }
 
-  bool is_write_cmd = (cid->opt_mask() & CO::WRITE) ||
-                      (under_script && dfly_cntx->conn_state.script_info->is_write);
+  bool is_write_cmd = cid->opt_mask() & CO::WRITE;
   bool under_multi = dfly_cntx->conn_state.exec_info.IsActive() && !is_trans_cmd;
 
   if (!etl.is_master && is_write_cmd && !dfly_cntx->is_replicating) {
@@ -733,8 +748,8 @@ bool Service::VerifyCommand(const CommandId* cid, CmdArgList args, ConnectionCon
   }
 
   if (under_multi) {
-    if (cmd_name == "SELECT") {
-      (*dfly_cntx)->SendError("Can not call SELECT within a transaction");
+    if (cmd_name == "SELECT" || absl::EndsWith(cmd_name, "SUBSCRIBE")) {
+      (*dfly_cntx)->SendError(absl::StrCat("Can not call ", cmd_name, " within a transaction"));
       return false;
     }
 
@@ -887,6 +902,7 @@ void Service::DispatchMC(const MemcacheParser::Command& cmd, std::string_view va
   char ttl_op[] = "EX";
 
   MCReplyBuilder* mc_builder = static_cast<MCReplyBuilder*>(cntx->reply_builder());
+  mc_builder->SetNoreply(cmd.no_reply);
 
   switch (cmd.type) {
     case MemcacheParser::REPLACE:
@@ -1337,6 +1353,7 @@ void Service::EvalInternal(const EvalArgs& eval_args, Interpreter* interpreter,
 
   CHECK(result == Interpreter::RUN_OK);
 
+  SinkReplyBuilder::ReplyAggregator agg(cntx->reply_builder());
   EvalSerializer ser{static_cast<RedisReplyBuilder*>(cntx->reply_builder())};
   if (!interpreter->IsResultSafe()) {
     (*cntx)->SendError("reached lua stack limit");
@@ -1516,6 +1533,7 @@ void Service::Exec(CmdArgList args, ConnectionContext* cntx) {
     Transaction* trans = cntx->transaction;
     cntx->transaction = nullptr;
 
+    SinkReplyBuilder::ReplyAggregator agg(rb);
     rb->StartArray(body.size());
     for (auto& scmd : body) {
       arg_vec.resize(scmd.NumArgs() + 1);
@@ -1541,6 +1559,7 @@ void Service::Exec(CmdArgList args, ConnectionContext* cntx) {
   }
 
   VLOG(1) << "StartExec " << exec_info.body.size();
+  SinkReplyBuilder::ReplyAggregator agg(rb);
   rb->StartArray(exec_info.body.size());
 
   if (!exec_info.body.empty()) {
@@ -1715,6 +1734,48 @@ void Service::Pubsub(CmdArgList args, ConnectionContext* cntx) {
   }
 }
 
+void Service::Command(CmdArgList args, ConnectionContext* cntx) {
+  unsigned cmd_cnt = 0;
+  registry_.Traverse([&](string_view name, const CommandId& cd) {
+    if ((cd.opt_mask() & CO::HIDDEN) == 0) {
+      ++cmd_cnt;
+    }
+  });
+
+  if (args.size() > 0) {
+    ToUpper(&args[0]);
+    string_view subcmd = ArgS(args, 0);
+    if (subcmd == "COUNT") {
+      return (*cntx)->SendLong(cmd_cnt);
+    } else {
+      return (*cntx)->SendError(kSyntaxErr, kSyntaxErrType);
+    }
+  }
+
+  (*cntx)->StartArray(cmd_cnt);
+
+  registry_.Traverse([&](string_view name, const CommandId& cd) {
+    if (cd.opt_mask() & CO::HIDDEN)
+      return;
+    (*cntx)->StartArray(6);
+    (*cntx)->SendSimpleString(cd.name());
+    (*cntx)->SendLong(cd.arity());
+    (*cntx)->StartArray(CommandId::OptCount(cd.opt_mask()));
+
+    for (uint32_t i = 0; i < 32; ++i) {
+      unsigned obit = (1u << i);
+      if (cd.opt_mask() & obit) {
+        const char* name = CO::OptName(CO::CommandOpt{obit});
+        (*cntx)->SendSimpleString(name);
+      }
+    }
+
+    (*cntx)->SendLong(cd.first_key_pos());
+    (*cntx)->SendLong(cd.last_key_pos());
+    (*cntx)->SendLong(cd.key_arg_step());
+  });
+}
+
 VarzValue::Map Service::GetVarzStats() {
   VarzValue::Map res;
 
@@ -1819,7 +1880,8 @@ void Service::RegisterCommands() {
       << CI{"PUNSUBSCRIBE", CO::NOSCRIPT | CO::LOADING, -1, 0, 0, 0}.MFUNC(PUnsubscribe)
       << CI{"FUNCTION", CO::NOSCRIPT, 2, 0, 0, 0}.MFUNC(Function)
       << CI{"MONITOR", CO::ADMIN, 1, 0, 0, 0}.MFUNC(Monitor)
-      << CI{"PUBSUB", CO::LOADING | CO::FAST, -1, 0, 0, 0}.MFUNC(Pubsub);
+      << CI{"PUBSUB", CO::LOADING | CO::FAST, -1, 0, 0, 0}.MFUNC(Pubsub)
+      << CI{"COMMAND", CO::LOADING | CO::NOSCRIPT, -1, 0, 0, 0}.MFUNC(Command);
 
   StreamFamily::Register(&registry_);
   StringFamily::Register(&registry_);
@@ -1834,6 +1896,7 @@ void Service::RegisterCommands() {
   SearchFamily::Register(&registry_);
 
   server_family_.Register(&registry_);
+  cluster_family_.Register(&registry_);
 
   if (VLOG_IS_ON(1)) {
     LOG(INFO) << "Multi-key commands are: ";
