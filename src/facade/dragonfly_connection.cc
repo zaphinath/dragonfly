@@ -1044,6 +1044,8 @@ void Connection::DispatchFiber(util::FiberSocketBase* peer) {
     if (cc_->conn_closing)
       break;
 
+    CHECK_EQ(ProactorBase::me(), socket_->proactor());
+
     // We really want to have batching in the builder if possible. This is especially
     // critical in situations where Nagle's algorithm can introduce unwanted high
     // latencies. However we can only batch if we're sure that there are more commands
@@ -1205,7 +1207,7 @@ void Connection::LaunchDispatchFiberIfNeeded() {
 void Connection::SendAsync(MessageHandle msg) {
   DCHECK(cc_);
   DCHECK(owner());
-  DCHECK_EQ(ProactorBase::me(), socket_->proactor());
+  CHECK_EQ(ProactorBase::me(), socket_->proactor());
 
   // "Closing" connections might be still processing commands, as we don't interrupt them.
   // So we still want to deliver control messages to them (like checkpoints).

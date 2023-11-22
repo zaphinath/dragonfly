@@ -382,6 +382,7 @@ void Transaction::StartMultiLockedAhead(DbIndex dbid, CmdArgList keys) {
 
 void Transaction::StartMultiNonAtomic() {
   DCHECK(multi_);
+  CHECK(multi_) << cid_->name() << " " << ProactorBase::me()->GetIndex();
   multi_->mode = NON_ATOMIC;
 }
 

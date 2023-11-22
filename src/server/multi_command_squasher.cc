@@ -43,6 +43,9 @@ MultiCommandSquasher::MultiCommandSquasher(absl::Span<StoredCmd> cmds, Connectio
   auto mode = cntx->transaction->GetMultiMode();
   base_cid_ = cntx->transaction->GetCId();
   atomic_ = mode != Transaction::NON_ATOMIC;
+
+  CHECK(base_cid_->name() == "EXEC" || base_cid_->name().rfind("EVAL", 0) == 0)
+      << base_cid_->name();
 }
 
 MultiCommandSquasher::ShardExecInfo& MultiCommandSquasher::PrepareShardInfo(ShardId sid) {
@@ -66,7 +69,7 @@ MultiCommandSquasher::ShardExecInfo& MultiCommandSquasher::PrepareShardInfo(Shar
 }
 
 MultiCommandSquasher::SquashResult MultiCommandSquasher::TrySquash(StoredCmd* cmd) {
-  DCHECK(cmd->Cid());
+  CHECK(cmd->Cid()) << "Invalid cid :(";
 
   if (!cmd->Cid()->IsTransactional() || (cmd->Cid()->opt_mask() & CO::BLOCKING) ||
       (cmd->Cid()->opt_mask() & CO::GLOBAL_TRANS))
@@ -74,6 +77,8 @@ MultiCommandSquasher::SquashResult MultiCommandSquasher::TrySquash(StoredCmd* cm
 
   cmd->Fill(&tmp_keylist_);
   auto args = absl::MakeSpan(tmp_keylist_);
+
+  VLOG(1) << "TrySquash " << cmd->Cid()->name() << " " << args << " batch " << order_.size();
 
   auto keys = DetermineKeys(cmd->Cid(), args);
   if (!keys.ok())
@@ -96,7 +101,16 @@ MultiCommandSquasher::SquashResult MultiCommandSquasher::TrySquash(StoredCmd* cm
   if (found_more || last_sid == kInvalidSid)
     return SquashResult::NOT_SQUASHED;
 
+  VLOG(1) << "Shard " << last_sid;
+
+  CHECK(cntx_->async_dispatch) << "On "
+                               << (cntx_->transaction ? cntx_->transaction->DebugId() : "//");
+  CHECK(!cntx_->sync_dispatch) << "On "
+                               << (cntx_->transaction ? cntx_->transaction->DebugId() : "//");
+
   auto& sinfo = PrepareShardInfo(last_sid);
+  CHECK(sinfo.local_tx) << "Expected tx on " << last_sid << " for " << cmd->Cid()->name() << " "
+                        << absl::MakeSpan(tmp_keylist_);
 
   sinfo.had_writes |= (cmd->Cid()->opt_mask() & CO::WRITE);
   sinfo.cmds.push_back(cmd);
