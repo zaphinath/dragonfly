@@ -218,6 +218,9 @@ class Connection : public util::Connection {
   // Connections will migrate at most once, and only when the flag --migrate_connections is true.
   void RequestAsyncMigration(util::fb2::ProactorBase* dest);
 
+  // Get quick debug info for logs
+  std::string GetDebugInfo() const;
+
  protected:
   void OnShutdown() override;
   void OnPreMigrateThread() override;
@@ -293,9 +296,6 @@ class Connection : public util::Connection {
 
   // Clear pipelined messages, disaptching only intrusive ones.
   void ClearPipelinedMessages();
-
-  // Get quick debug info for logs
-  std::string DebugInfo() const;
 
   std::pair<std::string, std::string> GetClientInfoBeforeAfterTid() const;
 

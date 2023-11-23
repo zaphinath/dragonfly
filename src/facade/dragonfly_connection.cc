@@ -969,7 +969,7 @@ void Connection::SquashPipeline(facade::SinkReplyBuilder* builder) {
   while (!dispatch_q_.empty()) {
     auto& msg = dispatch_q_.front();
     CHECK(holds_alternative<PipelineMessagePtr>(msg.handle))
-        << "Found " << msg.handle.index() << " on " << DebugInfo();
+        << "Found " << msg.handle.index() << " on " << GetDebugInfo();
 
     squash_msgs.push_back(std::move(std::get<PipelineMessagePtr>(msg.handle)));
     squash_cmds.push_back(absl::MakeSpan(squash_msgs.back()->args));
@@ -1007,7 +1007,7 @@ void Connection::ClearPipelinedMessages() {
   queue_backpressure_->ec.notifyAll();
 }
 
-std::string Connection::DebugInfo() const {
+std::string Connection::GetDebugInfo() const {
   std::string info = "{";
 
   absl::StrAppend(&info, "phase=", phase_, ", ");
@@ -1079,7 +1079,7 @@ void Connection::DispatchFiber(util::FiberSocketBase* peer) {
 
       if (ShouldEndDispatchFiber(msg)) {
         RecycleMessage(std::move(msg));
-        CHECK(dispatch_q_.empty()) << DebugInfo();
+        CHECK(dispatch_q_.empty()) << GetDebugInfo();
         return;  // don't set conn closing flag
       }
 

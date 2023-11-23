@@ -45,7 +45,7 @@ MultiCommandSquasher::MultiCommandSquasher(absl::Span<StoredCmd> cmds, Connectio
   atomic_ = mode != Transaction::NON_ATOMIC;
 
   CHECK(base_cid_->name() == "EXEC" || base_cid_->name().rfind("EVAL", 0) == 0)
-      << base_cid_->name();
+      << base_cid_->name() << " on " << cntx->conn()->GetDebugInfo();
 }
 
 MultiCommandSquasher::ShardExecInfo& MultiCommandSquasher::PrepareShardInfo(ShardId sid) {
