@@ -130,9 +130,9 @@ jobs:
         run: |
           # place all artifacts at the same location
           mkdir -p results-artifacts
-          ls -l ${{ env.RELEASE_DIR }}
           if [ -f /etc/debian_version ]; then
             mv ${{ env.RELEASE_DIR }}/dragonfly-*tar.gz results-artifacts
+            ls -l *.deb
             mv dragonfly*.deb results-artifacts
             mv dragonfly-dbg*.deb results-artifacts
           else
