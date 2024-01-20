@@ -133,8 +133,7 @@ jobs:
           if [ -f /etc/debian_version ]; then
             mv ${{ env.RELEASE_DIR }}/dragonfly-*tar.gz results-artifacts
             ls -l *.deb
-            mv dragonfly*.deb results-artifacts
-            mv dragonfly-dbg*.deb results-artifacts
+            mv ./*.deb ./results-artifacts/
           else
             ls -l *.rpm
             mv ./*.rpm ./results-artifacts/
