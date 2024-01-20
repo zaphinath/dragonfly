@@ -116,13 +116,24 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git describe --always --tags ${{ github.sha }}
           ./tools/release.sh
+
+      - name: Create package
+        run: |
           # once the build is over, we want to generate a Debian package
           if [ -f /etc/debian_version ]; then
             ./tools/packaging/generate_debian_package.sh ${{ env.RELEASE_DIR }}/dragonfly-x86_64
-            ./tools/packaging/generate_debian_package.sh ${{ env.RELEASE_DIR }}/dragonfly-dbg-x86_64
           else
             echo "Creating package for ${{github.ref_name}}"
             ./tools/packaging/rpm/build_rpm.sh ${{ env.RELEASE_DIR }}/dragonfly-x86_64.tar.gz ${{github.ref_name}}
+          fi
+
+      - name: Create Debug package
+        run: |
+          # once the build is over, we want to generate a Debian package
+          if [ -f /etc/debian_version ]; then
+            ./tools/packaging/generate_debian_package.sh ${{ env.RELEASE_DIR }}/dragonfly-dbg-x86_64
+          else
+            echo "Creating package for ${{github.ref_name}}"
             ./tools/packaging/rpm/build_rpm.sh ${{ env.RELEASE_DIR }}/dragonfly-dbg-x86_64.tar.gz ${{github.ref_name}}
           fi
 
@@ -141,7 +152,8 @@ jobs:
           mkdir -p results-artifacts
           if [ -f /etc/debian_version ]; then
             mv ${{ env.RELEASE_DIR }}/dragonfly-*tar.gz results-artifacts
-            mv dragonfly*.deb results-artifacts
+            ls -l *.deb
+            mv ./*.deb ./results-artifacts/
           else
             ls -l *.rpm
             mv ./*.rpm ./results-artifacts/
