@@ -9,7 +9,7 @@
 # * moreutils
 # * debhelper
 # e.g. apt update -y && apt install -y git moreutils debhelper
-# Please note that is must run from main branch.
+# Please note that is must run from main branch
 # Best running this from inside a container.
 # The result are writing to the location from which you would execute the script (not where the script is located).
 # Version number is the tag number.
@@ -62,11 +62,6 @@ ${BASE_PATH}/${CHANGELOG_SCRIPT} ${ROOT_ABS_PATH} || cleanup "failed to generate
 
 MY_DIR=${PWD}
 cd ${BASE_PATH}
-
-# if dbg package, then update the control file to reflect that
-if [[ $VERSION_FILE == *"-dbg"* ]]; then
-    sed -i 's/^Package: dragonfly$/Package: dragonfly-dbg/' ./debian/control
-fi
 
 dpkg-buildpackage --build=binary || cleanup "failed to generate the package"
 
