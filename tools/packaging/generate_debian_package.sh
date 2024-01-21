@@ -56,11 +56,7 @@ cp ${SCRIPT_PATH}/${CHANGELOG_SCRIPT} ${BASE_PATH} || cleanup "failed to copy ch
 
 mkdir -p ${BINARY_TARGET_DIR} || cleanup "failed to create install directory for building the package"
 
-if [[ ${VERSION_FILE} == *"-dbg"* ]]; then
-    cp ${VERSION_FILE} ${BINARY_TARGET_DIR}/dragonfly-dbg || cleanup "failed to copy binary to target dir"
-else
-    cp ${VERSION_FILE} ${BINARY_TARGET_DIR}/dragonfly || cleanup "failed to copy binary to target dir"
-fi
+ cp ${VERSION_FILE} ${BINARY_TARGET_DIR}/dragonfly || cleanup "failed to copy binary to target dir"
 
 ${BASE_PATH}/${CHANGELOG_SCRIPT} ${ROOT_ABS_PATH} || cleanup "failed to generate changelog for package"
 
@@ -69,8 +65,8 @@ cd ${BASE_PATH}
 
 # update control based on -dbg suffix
 if [[ ${VERSION_FILE} == *"-dbg"* ]]; then
-    sed -i 's/^Package: dragonfly$/Package: dragonfly-dbg/' debian/control
-    sed -i 's/^Source: dragonfly$/Source: dragonfly-dbg/' debian/control
+    sed -i 's/^Package: dragonfly$/Package: dragonfly-dbg/' ./debian/control
+    sed -i 's/^Source: dragonfly$/Source: dragonfly-dbg/' ./debian/control
 fi
 
 dpkg-buildpackage --build=binary || cleanup "failed to generate the package"
