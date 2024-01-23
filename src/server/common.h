@@ -60,6 +60,10 @@ struct KeyLockArgs {
   DbIndex db_index = 0;
   ArgSlice args;
   unsigned key_step = 1;
+
+  // Whether we should persist the string representation of the key when
+  // adding it to the tx-lock table.
+  bool should_persist = false;
 };
 
 // Describes key indices.

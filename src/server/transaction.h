@@ -560,8 +560,10 @@ class Transaction {
   // Never access directly with index, always use SidToId.
   absl::InlinedVector<PerShardData, 4> shard_data_;  // length = shard_count
 
-  // Stores arguments of the transaction (i.e. keys + values) partitioned by shards.
-  absl::InlinedVector<std::string_view, 4> args_;
+  // Stores keys/values of the transaction partitioned by shards.
+  // We need values as well since we reorder keys, and we need to know what value corresponds
+  // to what key.
+  absl::InlinedVector<std::string_view, 4> kv_args_;
 
   // Stores the full undivided command.
   CmdArgList full_args_;

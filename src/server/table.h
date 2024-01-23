@@ -76,7 +76,77 @@ struct DbTableStats {
   DbTableStats& operator+=(const DbTableStats& o);
 };
 
-using LockTable = absl::flat_hash_map<std::string, IntentLock>;
+// We use LockKey for LockTable keys because of the multi transactions
+// that unlock asynchronously. We must ensure the existence of keys outside of
+// multi-transaction lifecycle.
+
+class LockKey {
+ public:
+  explicit LockKey(std::string_view str) : val_(str) {
+  }
+  explicit LockKey(const std::string& str) : val_(str) {
+  }
+
+  std::string_view AsView() const {
+    if (std::holds_alternative<std::string_view>(val_)) {
+      return std::get<std::string_view>(val_);
+    } else {
+      return std::get<std::string>(val_);
+    }
+  }
+
+  bool operator==(std::string_view str) const {
+    return AsView() == str;
+  }
+
+  bool operator==(const LockKey& o) const {
+    return *this == o.AsView();
+  }
+
+  LockKey& operator=(std::string_view str) {
+    val_.emplace<std::string_view>(str);
+    return *this;
+  }
+
+  LockKey& operator=(std::string str) {
+    val_.emplace<std::string_view>(str);
+    return *this;
+  }
+
+  struct Hasher {
+    using is_transparent = void;  // to allow heterogeneous lookups.
+
+    size_t operator()(const LockKey& o) const {
+      return absl::Hash<std::string_view>{}(o.AsView());
+    }
+
+    size_t operator()(std::string_view s) const {
+      return absl::Hash<std::string_view>{}(s);
+    }
+  };
+
+  struct Eq {
+    using is_transparent = void;  // to allow heterogeneous lookups.
+
+    bool operator()(const LockKey& left, const LockKey& right) const {
+      return left == right;
+    }
+
+    bool operator()(const LockKey& left, std::string_view right) const {
+      return left == right;
+    }
+  };
+
+  friend std::ostream& operator<<(std::ostream& stream, const LockKey& lk) {
+    stream << lk.AsView();
+    return stream;
+  }
+
+ private:
+  std::variant<std::string_view, std::string> val_;
+};
+
+using LockTable = absl::flat_hash_map<LockKey, IntentLock, LockKey::Hasher, LockKey::Eq>;
 
 // A single Db table that represents a table that can be chosen with "SELECT" command.
 struct DbTable : boost::intrusive_ref_counter<DbTable, boost::thread_unsafe_counter> {
