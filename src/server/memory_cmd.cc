@@ -10,6 +10,7 @@
 #include "base/io_buf.h"
 #include "facade/dragonfly_connection.h"
 #include "facade/error.h"
+#include "server/allocation_sampler.h"
 #include "server/engine_shard_set.h"
 #include "server/main_service.h"
 #include "server/server_family.h"
@@ -118,6 +119,21 @@ void MemoryCmd::Run(CmdArgList args) {
       mi_heap_collect(mi_heap_get_backing(), true);
     });
     return cntx_->SendSimpleString("OK");
+  }
+
+  if (sub_cmd == "TRACK-START") {
+    AllocationSampler::Get().Enable();
+    return cntx_->SendOk();
+  }
+
+  if (sub_cmd == "TRACK-PRINT") {
+    AllocationSampler::Get().Print();
+    return cntx_->SendOk();
+  }
+
+  if (sub_cmd == "TRACK-STOP") {
+    AllocationSampler::Get().Disable();
+    return cntx_->SendOk();
   }
 
   if (sub_cmd == "MALLOC-STATS") {

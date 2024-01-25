@@ -30,7 +30,7 @@ if (NOT APPLE)
   cxx_test(search/aggregator_test dfly_test_lib LABELS DFLY)
 endif()
 
-add_library(dragonfly_lib engine_shard_set.cc channel_store.cc
+add_library(dragonfly_lib engine_shard_set.cc channel_store.cc allocation_sampler.cc
             config_registry.cc conn_context.cc debugcmd.cc dflycmd.cc
             generic_family.cc hset_family.cc json_family.cc
             ${SEARCH_FILES}

@@ -8,6 +8,9 @@
 #include "absl/strings/numbers.h"
 #ifdef NDEBUG
 #include <mimalloc-new-delete.h>
+#else
+#define INJECT_ALLOCATION_SAMPLER
+#include "allocation_sampler.h"
 #endif
 
 #include <absl/flags/parse.h>
