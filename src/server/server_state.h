@@ -259,6 +259,10 @@ class ServerState {  // public struct - to allow initialization.
   // @is_write controls whether the command is a write command or not.
   void AwaitPauseState(bool is_write);
 
+  // Awaits until the migration is finished and new cluster config is applied
+  void AwaitMigrationFinalization();
+  void SetIsMigrationFinalization(bool state);
+
   bool IsPaused() const;
 
   SlowLogShard& GetSlowLog() {
@@ -287,6 +291,9 @@ class ServerState {  // public struct - to allow initialization.
   // notified when the break is over.
   int client_pauses_[2] = {};
   EventCount client_pause_ec_;
+
+  bool is_migration_finalization = false;
+  EventCount migration_finalization_ec_;
 
   using Counter = util::SlidingCounter<7>;
   Counter qps_;

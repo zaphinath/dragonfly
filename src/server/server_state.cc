@@ -173,6 +173,14 @@ bool ServerState::IsPaused() const {
   return (client_pauses_[0] + client_pauses_[1]) > 0;
 }
 
+void ServerState::AwaitMigrationFinalization() {
+  migration_finalization_ec_.await([this] { return !is_migration_finalization; });
+}
+
+void ServerState::SetIsMigrationFinalization(bool state) {
+  is_migration_finalization = state;
+}
+
 Interpreter* ServerState::BorrowInterpreter() {
   return interpreter_mgr_.Get();
 }

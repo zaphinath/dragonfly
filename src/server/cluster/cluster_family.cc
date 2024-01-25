@@ -509,6 +509,27 @@ void ClusterFamily::DflyClusterConfig(CmdArgList args, ConnectionContext* cntx) 
 
   lock_guard gu(set_config_mu);
 
+  if (!outgoing_migration_jobs_.empty()) {
+    // TODO refactor after we approve cluster migration finalization approach
+    auto deleted_slots =
+        GetDeletedSlots(false, tl_cluster_config->GetOwnedSlots(), new_config->GetOwnedSlots());
+
+    if (!deleted_slots.empty()) {
+      for (const auto& migration : outgoing_migration_jobs_) {
+        // I use realy weak check here and suppose that new config stops
+        // only one migration and don't drop extra slots
+        // TODO add additional checks or refactor
+        if (ContainsAllSlots(deleted_slots, migration.GetSlotRange())) {
+          server_family_->service().proactor_pool().AwaitFiberOnAll([] {
+            ServerState::tlocal()->SetIsMigrationFinalization(true);
+            tl_cluster_config->SetMigratedSlots(std::move(deleted_slots));
+          });
+          break;
+        }
+      }
+    }
+  }
+
   bool is_first_config = true;
   SlotSet before;
   if (tl_cluster_config != nullptr) {

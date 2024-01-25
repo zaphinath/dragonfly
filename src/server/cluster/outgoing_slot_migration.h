@@ -30,9 +30,14 @@ class OutgoingMigration {
   const std::string& GetHostIp() const {
     return host_ip_;
   };
+
   uint16_t GetPort() const {
     return port_;
   };
+
+  const std::vector<ClusterConfig::SlotRange>& GetSlotRange() const {
+    return slots_;
+  }
 
  private:
   // SliceSlotMigration manages state and data transfering for the corresponding shard
